@@ -30,3 +30,11 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Latigo build/run artifacts
+/latigo.wasm
+/latigo-local
+/latigo-guest
+*.wasm
+/latigo.events.jsonl
+/workspace/
