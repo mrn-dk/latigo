@@ -67,11 +67,31 @@ event log. See [docs/ABI.md](docs/ABI.md#trust-tiers-and-the-single-egress-rule)
 ## Compaction, checkpoints & subagents
 
 **Transcript compaction.** The in-guest agent loop manages its own context
-window through overridable strategy points — `ShouldCompact` decides when, and
-`Compact` decides how. The default keeps the system prompt and goal, elides the
-middle of the transcript, and keeps the most recent turns. It's pure in-guest
-logic (no hostcall), so it's deterministic and free to replay. A host embedding
-the harness can swap in a token-budget-aware or LLM-summarising compactor.
+window through overridable strategy points: `ShouldCompact` (when), `Compact`
+(how), `EstimateTokens` (budget accounting), and `Summarize` (how the elided
+turns are condensed). By default `ShouldCompact` fires at ~80% of the advertised
+token budget (`Capabilities.MaxLLMTokens`, à la Claude Code's auto-compact),
+falling back to a message-count threshold when no budget is known; `Compact`
+keeps the system prompt and goal, replaces the middle via `Summarize`, and keeps
+the most recent turns verbatim.
+
+Two `Summarize` strategies ship, selectable with `-compaction`:
+
+- `window` (default) — a deterministic placeholder for the elided turns. No
+  hostcall, so it's free and trivially replay-safe.
+- `llm` — asks the model itself to write a structured briefing (files touched,
+  decisions, task state, TODOs). Because that summary is produced by an
+  `llm.call` hostcall, it is **recorded once and replayed verbatim** — so even
+  model-driven compaction stays deterministic on replay, which most harnesses
+  can't offer. It degrades to the deterministic placeholder on any error.
+
+```sh
+./latigo-local -wasm latigo.wasm -compaction llm "a long, context-heavy task"
+```
+
+All four are plain fields on `guest.Agent`, so an embedder can drop in its own
+policy (tool-output elision, externalising notes to the VFS, hierarchical
+summarisation, …) without touching the loop.
 
 **Durable checkpoints & log compaction.** With the optional `checkpoint`
 capability the guest periodically snapshots its state (`state.checkpoint`) and
