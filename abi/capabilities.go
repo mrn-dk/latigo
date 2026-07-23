@@ -25,6 +25,10 @@ type Capabilities struct {
 	// so every run is permanently stamped as sandboxed or ambient. The guest
 	// cannot negotiate it away; it purely reflects the host's grant.
 	Ambient bool `json:"ambient"`
+	// Checkpoint reports whether state.checkpoint/state.restore are available.
+	// When true the guest periodically snapshots its state so the host can
+	// compact the log to bounded replay, and resume interrupted runs.
+	Checkpoint bool `json:"checkpoint"`
 	// Approval reports whether approval.await is available. When false, the
 	// guest treats every action as pre-approved.
 	Approval bool `json:"approval"`
@@ -45,6 +49,7 @@ func Negotiate(want, have Capabilities) Capabilities {
 	eff := have
 	eff.Exec = want.Exec && have.Exec
 	eff.HTTP = want.HTTP && have.HTTP
+	eff.Checkpoint = want.Checkpoint && have.Checkpoint
 	eff.Approval = want.Approval && have.Approval
 	eff.FSWrite = want.FSWrite && have.FSWrite
 	// Ambient is a property of the host grant, not something the guest chooses:
