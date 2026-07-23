@@ -146,6 +146,40 @@ type ExecRunResponse struct {
 	Stderr   []byte `json:"stderr"`
 }
 
+// ----- http.fetch (optional, governed egress) -----
+
+// HTTPFetchRequest is a single HTTP transaction the guest asks the host to
+// perform on its behalf. The host is free to clamp MaxBytes/Timeout down to its
+// own policy limits; the guest's values are hints, never overrides.
+type HTTPFetchRequest struct {
+	Method  string            `json:"method,omitempty"` // default GET
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+	// Body is the request body (base64-encoded by encoding/json).
+	Body []byte `json:"body,omitempty"`
+	// MaxBytes caps the response body the guest is willing to receive; the host
+	// applies its own hard cap regardless.
+	MaxBytes int `json:"max_bytes,omitempty"`
+	// TimeoutMS is an advisory per-request timeout; the host clamps it.
+	TimeoutMS int `json:"timeout_ms,omitempty"`
+	// FollowRedirect asks the host to follow 3xx redirects (each hop is
+	// re-checked against policy). Default false.
+	FollowRedirect bool `json:"follow_redirect,omitempty"`
+}
+
+// HTTPFetchResponse is the host's recorded result of a fetch. Because it is a
+// hostcall, it is captured in the event log and returned verbatim on replay.
+type HTTPFetchResponse struct {
+	Status  int               `json:"status"`
+	Headers map[string]string `json:"headers,omitempty"`
+	// Body is the (possibly truncated) response body.
+	Body []byte `json:"body"`
+	// Truncated is true when the body hit the host's MaxBytes cap.
+	Truncated bool `json:"truncated,omitempty"`
+	// FinalURL is the URL after any redirects were followed.
+	FinalURL string `json:"final_url,omitempty"`
+}
+
 // ----- msg.* -----
 
 type MsgSendRequest struct {
