@@ -57,6 +57,13 @@ func (l *EventLog) Append(kind events.Kind, payload any) (events.Event, error) {
 	return ev, nil
 }
 
+// Seq returns the sequence number of the most recently appended event.
+func (l *EventLog) Seq() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.seq
+}
+
 // Close flushes and closes the log.
 func (l *EventLog) Close() error {
 	l.mu.Lock()

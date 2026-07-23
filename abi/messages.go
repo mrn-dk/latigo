@@ -224,6 +224,24 @@ type LogAppendRequest struct {
 
 type LogAppendResponse struct{}
 
+// ----- state.checkpoint / state.restore (optional) -----
+
+type StateCheckpointRequest struct {
+	// State is an opaque, guest-defined snapshot blob.
+	State RawJSON `json:"state"`
+}
+
+type StateCheckpointResponse struct{}
+
+type StateRestoreRequest struct{}
+
+type StateRestoreResponse struct {
+	// Found reports whether a snapshot was available to restore from.
+	Found bool `json:"found"`
+	// State is the most recent snapshot blob when Found is true.
+	State RawJSON `json:"state,omitempty"`
+}
+
 // ----- clock.now / rand.bytes -----
 
 type ClockNowRequest struct{}

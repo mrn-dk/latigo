@@ -45,7 +45,7 @@ when an optional capability is absent (e.g. no `approval` capability means every
 action is treated as pre-approved).
 
 Required operations are always present on a conformant host. Optional
-capabilities are `http`, `exec`, `approval`, and `fs_write`.
+capabilities are `http`, `checkpoint`, `exec`, `approval`, and `fs_write`.
 
 ### Trust tiers and the single-egress rule
 
@@ -84,6 +84,7 @@ is permanently auditable.
 | `msg` | `msg.send`, `msg.recv` | yes | Messaging to/from the outside world |
 | `approval` | `approval.await` | optional | Human-in-the-loop gating |
 | `log` | `log.append` | yes | Structured logging |
+| `state` | `state.checkpoint`, `state.restore` | optional | Durable state snapshots for log compaction, bounded replay, and resuming interrupted runs |
 | `clock` | `clock.now` | yes | Host-injected time (recorded for determinism) |
 | `rand` | `rand.bytes` | yes | Host-injected randomness (recorded for determinism) |
 

@@ -67,6 +67,13 @@ const (
 	// Structured logging.
 	OpLogAppend Op = "log.append"
 
+	// Durable state checkpoint/restore (optional). The guest pushes an opaque
+	// state snapshot with state.checkpoint; state.restore returns the latest
+	// snapshot so a compacted or interrupted run can resume without replaying
+	// every prior hostcall.
+	OpStateCheckpoint Op = "state.checkpoint"
+	OpStateRestore    Op = "state.restore"
+
 	// Host-injected clock and randomness (kept in the log for determinism).
 	OpClockNow  Op = "clock.now"
 	OpRandBytes Op = "rand.bytes"

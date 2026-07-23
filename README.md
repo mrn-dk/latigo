@@ -64,6 +64,42 @@ never inherits the host environment, and network-isolates the child unless you
 opt into unsafe networked exec. Enabling it stamps the run as `ambient` in the
 event log. See [docs/ABI.md](docs/ABI.md#trust-tiers-and-the-single-egress-rule).
 
+## Compaction, checkpoints & subagents
+
+**Transcript compaction.** The in-guest agent loop manages its own context
+window through overridable strategy points — `ShouldCompact` decides when, and
+`Compact` decides how. The default keeps the system prompt and goal, elides the
+middle of the transcript, and keeps the most recent turns. It's pure in-guest
+logic (no hostcall), so it's deterministic and free to replay. A host embedding
+the harness can swap in a token-budget-aware or LLM-summarising compactor.
+
+**Durable checkpoints & log compaction.** With the optional `checkpoint`
+capability the guest periodically snapshots its state (`state.checkpoint`) and
+restores it at startup (`state.restore`). The host records snapshots as
+`checkpoint` events, and `host.CompactLog` rewrites the log to the tail since the
+last checkpoint — so on replay the guest **resumes from the snapshot instead of
+re-running** the folded turns. Replay stays reconstruction, never re-execution;
+the log just stops growing without bound (and interrupted runs can resume).
+
+```sh
+./latigo-local -wasm latigo.wasm "long task"   # checkpointing on by default
+./latigo-local -wasm latigo.wasm -compact       # compact the log to the last checkpoint
+./latigo-local -wasm latigo.wasm -replay         # bounded replay from the checkpoint
+```
+
+**Subagents.** There is no subagent primitive in the ABI — orchestration is the
+host's business. Instead a host exposes subagents as an ordinary tool: the
+reference `-subagents` flag registers a `delegate` tool that spins up a fresh,
+isolated child guest to run a subtask to completion and returns its summary.
+Because per-agent spin-up is milliseconds, fanning out to short-lived subagents
+is cheap; and because the child's result is recorded as the parent's tool
+result, subagents are durable and replay-safe without re-running the child.
+Nesting is bounded by `-max-depth`.
+
+```sh
+./latigo-local -wasm latigo.wasm -subagents -max-depth 2 "research X, delegating subtasks"
+```
+
 Run everything (including a real wasm run + replay integration test):
 
 ```sh
