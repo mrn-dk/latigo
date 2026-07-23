@@ -44,8 +44,29 @@ cross-version migration is possible.
 
 ## Checkpoints & compaction
 
-A `checkpoint` records `since_seq` (the last event folded into the snapshot) and
-an opaque `state` blob defined by the guest (`(*guest.Agent).Checkpoint`). A host
-may **compact** the log by discarding events up to and including `since_seq` and
-starting bounded replay from the checkpoint, enabling long-running agents and
-cross-version migration.
+Checkpointing is an optional capability (`Capabilities.Checkpoint`). When the
+host grants it, the guest periodically calls **`state.checkpoint`** with an
+opaque, restorable snapshot of its state (transcript, virtual filesystem
+contents, and the current turn — see the guest's `agentSnapshot`). The host
+records each as a `checkpoint` event carrying `since_seq` and the `state` blob.
+`state.checkpoint` is written as a `checkpoint` event, not a `hostcall`, so the
+snapshot bytes are not duplicated into the hostcall stream.
+
+At startup the guest calls **`state.restore`** (always its second hostcall,
+after `tool.list`). On a fresh run this returns `found: false` and the guest
+starts normally. On a resumed or compacted run it returns the latest snapshot,
+and the guest rehydrates and continues from the recorded turn.
+
+**Compaction** (`host.CompactLog`) rewrites the log to the tail since the most
+recent checkpoint: it keeps `run_start`, the guest's initial `tool.list` and
+`state.restore` (rewriting the latter to hand back the snapshot), every event
+after the checkpoint, and `run_end` — dropping the hostcalls of all folded
+turns. On replay the guest restores from the snapshot instead of re-running
+those turns, so **replay stays reconstruction, never re-execution**, while the
+log is bounded. To keep replay aligned, the reference host injects a synthetic
+journal entry for each retained checkpoint (the guest re-issues `state.checkpoint`
+at the same points), and skips re-emitting the boundary checkpoint it resumed
+from.
+
+This is what makes long-running agents practical: the log does not grow without
+bound, and an interrupted run can resume from its last snapshot.
