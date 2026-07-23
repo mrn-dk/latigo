@@ -32,6 +32,9 @@ type RunConfig struct {
 	Goal     string
 	Model    string
 	MaxTurns int
+	// Compaction selects the guest's transcript compaction strategy
+	// ("window" or "llm"); empty uses the guest default.
+	Compaction string
 	// Stdout/Stderr capture the guest's process output.
 	Stdout io.Writer
 	Stderr io.Writer
@@ -94,7 +97,8 @@ func (h *Host) Run(ctx context.Context, cfg RunConfig) error {
 		WithEnv("LATIGO_GOAL", cfg.Goal).
 		WithEnv("LATIGO_MODEL", cfg.Model).
 		WithEnv("LATIGO_CAPABILITIES", string(capsJSON)).
-		WithEnv("LATIGO_MAX_TURNS", itoa(cfg.MaxTurns))
+		WithEnv("LATIGO_MAX_TURNS", itoa(cfg.MaxTurns)).
+		WithEnv("LATIGO_COMPACTION", cfg.Compaction)
 
 	// run_start is the first durable event (records negotiated capabilities).
 	if h.log != nil && !h.replaying {

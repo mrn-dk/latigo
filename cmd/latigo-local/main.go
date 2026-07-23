@@ -39,6 +39,7 @@ func main() {
 		compact    = flag.Bool("compact", false, "compact the event log to the last checkpoint, then exit")
 		subagents  = flag.Bool("subagents", false, "expose a host-orchestrated 'delegate' subagent tool")
 		maxDepth   = flag.Int("max-depth", 2, "maximum subagent nesting depth")
+		compaction = flag.String("compaction", "window", "transcript compaction strategy: window|llm")
 	)
 	flag.Parse()
 	goal := strings.Join(flag.Args(), " ")
@@ -51,7 +52,7 @@ func main() {
 		baseURL: *baseURL, apiKey: *apiKey, goal: goal, maxTurns: *maxTurns,
 		execAllow: *allowExec, execNet: *execNet, allowHTTP: *allowHTTP, httpAllow: *httpAllow,
 		approve: *approve, replay: *replay, checkpoint: *checkpoint, compact: *compact,
-		subagents: *subagents, maxDepth: *maxDepth,
+		subagents: *subagents, maxDepth: *maxDepth, compaction: *compaction,
 	}
 	if err := run(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "latigo-local:", err)
@@ -65,6 +66,7 @@ type runOptions struct {
 	baseURL, apiKey, goal          string
 	maxTurns, maxDepth             int
 	execAllow, httpAllow           string
+	compaction                     string
 	execNet, allowHTTP             bool
 	approve, replay                bool
 	checkpoint, compact, subagents bool
@@ -100,7 +102,7 @@ func run(o runOptions) error {
 	configureHost(h, wasm, o, 0, nil)
 
 	return h.Run(ctx, host.RunConfig{
-		Wasm: wasm, Goal: o.goal, Model: o.model, MaxTurns: o.maxTurns,
+		Wasm: wasm, Goal: o.goal, Model: o.model, MaxTurns: o.maxTurns, Compaction: o.compaction,
 		Stdout: prefixWriter("guest> "), Stderr: prefixWriter("guest! "),
 	})
 }
@@ -230,7 +232,7 @@ func runSubagent(ctx context.Context, wasm []byte, o runOptions, goal string, de
 	so.root = filepath.Join(o.root, fmt.Sprintf(".sub-%d", depth)) // isolated workspace
 	configureHost(h, wasm, so, depth, &result)
 	err := h.Run(ctx, host.RunConfig{
-		Wasm: wasm, Goal: goal, Model: o.model, MaxTurns: o.maxTurns,
+		Wasm: wasm, Goal: goal, Model: o.model, MaxTurns: o.maxTurns, Compaction: o.compaction,
 		Stdout: discardWriter{}, Stderr: discardWriter{},
 	})
 	return result, err
