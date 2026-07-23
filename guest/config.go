@@ -17,6 +17,9 @@ type Config struct {
 	Model        string
 	MaxTurns     int
 	Capabilities abi.Capabilities
+	// Compaction selects the transcript compaction strategy: "window" (default,
+	// deterministic) or "llm" (model-driven summarisation).
+	Compaction string
 }
 
 // Environment variable / arg names understood by the guest.
@@ -25,14 +28,16 @@ const (
 	EnvGoal         = "LATIGO_GOAL"
 	EnvModel        = "LATIGO_MODEL"
 	EnvMaxTurns     = "LATIGO_MAX_TURNS"
+	EnvCompaction   = "LATIGO_COMPACTION"
 )
 
 // LoadConfig reads the run configuration from the environment.
 func LoadConfig() Config {
 	cfg := Config{
-		Goal:     os.Getenv(EnvGoal),
-		Model:    os.Getenv(EnvModel),
-		MaxTurns: 16,
+		Goal:       os.Getenv(EnvGoal),
+		Model:      os.Getenv(EnvModel),
+		MaxTurns:   16,
+		Compaction: os.Getenv(EnvCompaction),
 	}
 	if v := os.Getenv(EnvCapabilities); v != "" {
 		_ = json.Unmarshal([]byte(v), &cfg.Capabilities)

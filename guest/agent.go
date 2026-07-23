@@ -30,6 +30,13 @@ type Agent struct {
 	ShouldCompact func(msgs []abi.LLMMessage) bool
 	// Compact rewrites the transcript (e.g. summarising older turns).
 	Compact func(a *Agent, msgs []abi.LLMMessage) []abi.LLMMessage
+	// EstimateTokens approximates the token footprint of a transcript, used by
+	// the default budget-based ShouldCompact.
+	EstimateTokens func(msgs []abi.LLMMessage) int
+	// Summarize condenses the elided middle of the transcript into one message.
+	// The default is a deterministic placeholder; llmSummarize (selected via the
+	// "llm" compaction strategy) asks the model instead.
+	Summarize func(a *Agent, old []abi.LLMMessage) abi.LLMMessage
 	// ShouldStop decides whether to terminate after a turn.
 	ShouldStop func(a *Agent, turn int) bool
 	// ShouldCheckpoint decides whether to snapshot durable state at the top of a
@@ -57,7 +64,17 @@ func NewAgent(cfg Config, client *Client) *Agent {
 		script: NewScriptRunner(ScriptBudget{}),
 	}
 	a.SystemPrompt = defaultSystemPrompt
-	a.ShouldCompact = func(msgs []abi.LLMMessage) bool { return len(msgs) > 40 }
+	a.EstimateTokens = estimateTokens
+	a.Summarize = selectSummarizer(cfg.Compaction)
+	// Trigger on the token budget when the host advertises one (like Claude
+	// Code's auto-compact near the context limit), else fall back to a simple
+	// message-count threshold.
+	a.ShouldCompact = func(msgs []abi.LLMMessage) bool {
+		if budget := a.cfg.Capabilities.MaxLLMTokens; budget > 0 {
+			return a.EstimateTokens(msgs) > budget*8/10 // ~80% of the window
+		}
+		return len(msgs) > 40
+	}
 	a.Compact = defaultCompact
 	a.ShouldStop = func(ag *Agent, turn int) bool { return ag.done || turn >= ag.cfg.MaxTurns }
 	// Snapshot state every few turns so the host can compact the log to a
@@ -198,13 +215,12 @@ func defaultCompact(a *Agent, msgs []abi.LLMMessage) []abi.LLMMessage {
 	if len(msgs) <= 6 {
 		return msgs
 	}
-	// Keep system + first user message, summarise the middle, keep the tail.
+	// Keep system + first user message (pinned context), summarise the middle
+	// via the Summarize strategy, and keep the most recent turns verbatim.
 	head := msgs[:2]
+	mid := msgs[2 : len(msgs)-4]
 	tail := msgs[len(msgs)-4:]
-	summary := abi.LLMMessage{
-		Role:    "user",
-		Content: fmt.Sprintf("[Earlier %d messages compacted for brevity.]", len(msgs)-6),
-	}
+	summary := a.Summarize(a, mid)
 	out := make([]abi.LLMMessage, 0, len(head)+1+len(tail))
 	out = append(out, head...)
 	out = append(out, summary)
