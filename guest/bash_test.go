@@ -17,7 +17,7 @@ func run(t *testing.T, b *Bash, script string) Result {
 
 func TestBashCoreutils(t *testing.T) {
 	vfs := NewVFS()
-	b := NewBash(vfs)
+	b := NewBash(vfs, nil)
 
 	cases := []struct {
 		name, script, wantOut string
@@ -48,7 +48,7 @@ func TestBashCoreutils(t *testing.T) {
 
 func TestBashPersistsToVFS(t *testing.T) {
 	vfs := NewVFS()
-	b := NewBash(vfs)
+	b := NewBash(vfs, nil)
 	run(t, b, `mkdir -p /work/sub && echo persisted > /work/sub/file`)
 	data, err := vfs.ReadFile("/work/sub/file")
 	if err != nil {

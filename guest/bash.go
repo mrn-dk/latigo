@@ -8,19 +8,31 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mrn-dk/latigo/abi"
 	"github.com/spf13/afero"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
 )
 
-// Bash is a virtual shell: mvdan/sh parses and interprets, while all I/O is
-// routed to a [VFS] through interp handlers. No host process is ever spawned.
-type Bash struct {
-	vfs *VFS
+// Fetcher performs a governed HTTP request. The guest's curl/wget builtins call
+// it; it is satisfied by *Client. A nil Fetcher means the host granted no
+// network capability, and curl/wget report that rather than reaching out.
+type Fetcher interface {
+	HTTPFetch(req abi.HTTPFetchRequest) (abi.HTTPFetchResponse, error)
 }
 
-// NewBash returns a virtual shell over vfs.
-func NewBash(vfs *VFS) *Bash { return &Bash{vfs: vfs} }
+// Bash is a virtual shell: mvdan/sh parses and interprets, while all I/O is
+// routed to a [VFS] through interp handlers. No host process is ever spawned.
+// The only path to the outside world is fetch (governed http.fetch), used by
+// the curl/wget builtins.
+type Bash struct {
+	vfs   *VFS
+	fetch Fetcher
+}
+
+// NewBash returns a virtual shell over vfs. fetch may be nil, in which case the
+// curl/wget builtins report that no network capability is available.
+func NewBash(vfs *VFS, fetch Fetcher) *Bash { return &Bash{vfs: vfs, fetch: fetch} }
 
 // Result is the outcome of running a script.
 type Result struct {

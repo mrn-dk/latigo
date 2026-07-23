@@ -134,6 +134,15 @@ func (c *Client) ExecRun(req abi.ExecRunRequest) (abi.ExecRunResponse, error) {
 	return r, err
 }
 
+// HTTPFetch performs a governed HTTP request through the host. It returns a
+// HostError with code "unsupported" when the host does not grant the HTTP
+// capability, which callers can detect with IsUnsupported.
+func (c *Client) HTTPFetch(req abi.HTTPFetchRequest) (abi.HTTPFetchResponse, error) {
+	var r abi.HTTPFetchResponse
+	err := c.call(abi.OpHTTPFetch, req, &r)
+	return r, err
+}
+
 func (c *Client) MsgSend(channel, content string) error {
 	return c.call(abi.OpMsgSend, abi.MsgSendRequest{Channel: channel, Content: content}, nil)
 }

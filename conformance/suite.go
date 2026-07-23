@@ -47,6 +47,7 @@ func Checks() []Check {
 		{"tool.list shape", checkToolList},
 		{"unknown op -> unsupported", checkUnknownOp},
 		{"malformed request -> invalid", checkMalformed},
+		{"http.fetch blocks SSRF (if advertised)", checkHTTPSSRF},
 	}
 }
 
@@ -167,6 +168,25 @@ func checkUnknownOp(t Transport, _ abi.Capabilities) error {
 	}
 	if raw.Code != abi.ErrUnsupported {
 		return fmt.Errorf("unknown op should return code %q, got %q (%q)", abi.ErrUnsupported, raw.Code, raw.Error)
+	}
+	return nil
+}
+
+// checkHTTPSSRF asserts the governed-egress safety contract: any host that
+// advertises the HTTP capability MUST refuse requests to the cloud metadata
+// endpoint (and, by extension, private space). Hosts without HTTP are skipped.
+func checkHTTPSSRF(t Transport, caps abi.Capabilities) error {
+	if !caps.HTTP {
+		return nil // capability not offered; nothing to verify
+	}
+	_, raw, err := call[abi.HTTPFetchRequest, abi.HTTPFetchResponse](t, abi.OpHTTPFetch,
+		abi.HTTPFetchRequest{URL: "http://169.254.169.254/latest/meta-data/"})
+	if err != nil {
+		return err
+	}
+	if raw.Code != abi.ErrDenied {
+		return fmt.Errorf("http.fetch to the metadata endpoint must be %q, got %q (%q)",
+			abi.ErrDenied, raw.Code, raw.Error)
 	}
 	return nil
 }

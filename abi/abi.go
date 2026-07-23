@@ -53,6 +53,10 @@ const (
 	// Optional native execution capability.
 	OpExecRun Op = "exec.run"
 
+	// Optional governed HTTP egress. The single sanctioned way for a guest to
+	// reach the network; the host mediates every request against a policy.
+	OpHTTPFetch Op = "http.fetch"
+
 	// Messaging between guest and the outside world.
 	OpMsgSend Op = "msg.send"
 	OpMsgRecv Op = "msg.recv"

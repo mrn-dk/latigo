@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/mrn-dk/latigo/abi"
 )
 
 // registerBuiltins adds the in-guest tools (bash, file access, skills, scripts)
@@ -12,9 +14,13 @@ import (
 func (a *Agent) registerBuiltins() {
 	r := a.tools
 
+	bashDesc := "Run a shell script in the virtual filesystem. Supports a coreutils subset (echo, cat, ls, grep, head, tail, wc, sort, find, mkdir, rm, cp, mv, touch, tee, ...), pipes, redirects, and control flow."
+	if a.cfg.Capabilities.HTTP {
+		bashDesc += " Also supports curl/wget for governed HTTP(S) requests (subset: -X -H -d -o -i -L -s --max-time)."
+	}
 	r.Add(Tool{
 		Name:        "bash",
-		Description: "Run a shell script in the virtual filesystem. Supports a coreutils subset (echo, cat, ls, grep, head, tail, wc, sort, find, mkdir, rm, cp, mv, touch, tee, ...), pipes, redirects, and control flow.",
+		Description: bashDesc,
 		Schema:      json.RawMessage(`{"type":"object","properties":{"script":{"type":"string","description":"the shell script to run"},"cwd":{"type":"string","description":"working directory (default /work)"}},"required":["script"]}`),
 		Invoke: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var in struct {
@@ -128,6 +134,47 @@ func (a *Agent) registerBuiltins() {
 			return out, nil
 		},
 	})
+
+	if a.cfg.Capabilities.HTTP {
+		r.Add(Tool{
+			Name:        "http_fetch",
+			Description: "Fetch a URL over HTTP(S) through the host's governed egress. Returns the status line, headers, and body. The host enforces an allowlist and may deny requests.",
+			Schema:      json.RawMessage(`{"type":"object","properties":{"url":{"type":"string"},"method":{"type":"string","description":"GET (default), POST, HEAD, ..."},"headers":{"type":"object","additionalProperties":{"type":"string"}},"body":{"type":"string"},"follow_redirect":{"type":"boolean"}},"required":["url"]}`),
+			Invoke: func(ctx context.Context, args json.RawMessage) (string, error) {
+				var in struct {
+					URL            string            `json:"url"`
+					Method         string            `json:"method"`
+					Headers        map[string]string `json:"headers"`
+					Body           string            `json:"body"`
+					FollowRedirect bool              `json:"follow_redirect"`
+				}
+				if err := json.Unmarshal(args, &in); err != nil {
+					return "", err
+				}
+				resp, err := a.client.HTTPFetch(abi.HTTPFetchRequest{
+					URL: in.URL, Method: in.Method, Headers: in.Headers,
+					Body: []byte(in.Body), FollowRedirect: in.FollowRedirect,
+				})
+				if err != nil {
+					if IsUnsupported(err) {
+						return "error: no network capability on this host", nil
+					}
+					return "error: " + err.Error(), nil
+				}
+				var b strings.Builder
+				fmt.Fprintf(&b, "HTTP %d %s\n", resp.Status, in.URL)
+				if resp.FinalURL != "" && resp.FinalURL != in.URL {
+					fmt.Fprintf(&b, "final-url: %s\n", resp.FinalURL)
+				}
+				b.WriteString("\n")
+				b.Write(resp.Body)
+				if resp.Truncated {
+					b.WriteString("\n[truncated at host byte cap]")
+				}
+				return b.String(), nil
+			},
+		})
+	}
 
 	r.Add(Tool{
 		Name:        "done",

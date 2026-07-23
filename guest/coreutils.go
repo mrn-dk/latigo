@@ -24,6 +24,17 @@ func (b *Bash) execHandler(ctx context.Context, args []string) error {
 	cmd := args[0]
 	rest := args[1:]
 
+	// curl/wget are the only builtins that reach the network; they route through
+	// the governed http.fetch capability (b.fetch), never a host process.
+	if cmd == "curl" || cmd == "wget" {
+		c := &cmdCtx{dir: hc.Dir, stdin: hc.Stdin, stdout: hc.Stdout, stderr: hc.Stderr, args: rest}
+		code := b.curl(cmd, c)
+		if code != 0 {
+			return interp.NewExitStatus(uint8(code))
+		}
+		return nil
+	}
+
 	fn, ok := coreutils[cmd]
 	if !ok {
 		fmt.Fprintf(hc.Stderr, "%s: command not found\n", cmd)

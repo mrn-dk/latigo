@@ -22,6 +22,8 @@ func newTestHost(t *testing.T) *host.Host {
 	h.Messaging(host.Messenger{})
 	h.Tools(host.NewStaticTools())
 	host.ScriptedMockLLM("test").Register(h)
+	// Advertise governed HTTP so the conformance suite verifies the SSRF guard.
+	h.HTTP(host.HTTPFetcher(host.HTTPPolicy{AllowHosts: []string{"*"}}))
 	return h
 }
 
