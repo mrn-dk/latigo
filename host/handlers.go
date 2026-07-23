@@ -250,11 +250,14 @@ func (h *Host) Approval(decide func(action string, details json.RawMessage) (boo
 // Exec -----------------------------------------------------------------------
 
 // Exec registers the optional exec.run capability using run. Passing nil omits
-// the capability, in which case exec.run returns "unsupported".
+// the capability, in which case exec.run returns "unsupported". Enabling exec
+// marks the run as Ambient: it runs native code with ungoverned OS authority,
+// which is recorded in run_start so the escalation is auditable.
 func (h *Host) Exec(run func(ctx context.Context, req abi.ExecRunRequest) (abi.ExecRunResponse, error)) {
 	if run == nil {
 		return
 	}
 	h.caps.Exec = true
+	h.caps.Ambient = true
 	h.Handle(abi.OpExecRun, handler(run))
 }
