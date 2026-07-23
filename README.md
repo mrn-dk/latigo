@@ -20,6 +20,7 @@ that ABI; this repo owns the contract.
 | [`cmd/latigo-guest/`](cmd/latigo-guest) | `main` compiled to WASM |
 | [`host/`](host) | Reference host library: dispatch, durability, replay, fs/llm/tools/exec/... handlers, wazero bridge |
 | [`cmd/latigo-local/`](cmd/latigo-local) | Reference local host CLI (local FS, OpenAI-compatible/Mortise LLM, JSONL log) |
+| [`cmd/latigo-bench/`](cmd/latigo-bench) | Spin-up benchmark harness (compile, warm/cold spin-up, Docker baseline) |
 | [`conformance/`](conformance) | Host conformance suite |
 | [`docs/`](docs) | [ABI spec](docs/ABI.md), [event schema](docs/EVENTS.md) |
 
@@ -46,6 +47,41 @@ Run everything (including a real wasm run + replay integration test):
 make test
 ```
 
+## Spin-up performance
+
+Latigo is designed so a host compiles the guest module **once** and then spins up
+many fresh, fully-isolated agents on demand. Because each agent is a new WASM
+instance (its own linear memory, VFS, and shell) rather than a new OS container,
+spin-up is measured in **milliseconds, not hundreds of milliseconds**.
+
+![Agent spin-up time vs Docker (p50, log scale)](docs/spinup.svg)
+
+Benchmark it yourself:
+
+```sh
+make bench            # compile + warm/cold spin-up
+make bench DOCKER=1   # also run the `docker run` baseline for comparison
+```
+
+Representative numbers on one x86-64 Linux dev machine (Go 1.25, wazero 1.12,
+9.0 MB guest module; p50 over 300/20 iterations):
+
+| Phase | What it measures | p50 |
+|-------|------------------|-----|
+| compile (one-time) | Compile the guest WASM to native code; done once per host process | ~2.5 s |
+| **spin-up: warm (per agent)** | **Instantiate a fresh, isolated sandbox from the hot module and boot the guest to ready** | **~10 ms** |
+| cold start (cached compile) | Fresh runtime + spin-up, reusing wazero's persisted compilation cache | ~87 ms |
+| cold start (compile + spin-up) | Fully cold path including a from-scratch compile | ~2.5 s |
+| `docker run --rm alpine true` | Start an empty container that does no work (baseline) | ~650 ms |
+
+The compile cost is paid **once** — at process start, or amortized across
+restarts via wazero's on-disk [compilation cache](https://pkg.go.dev/github.com/tetratelabs/wazero#NewCompilationCacheWithDir).
+After that, each new agent boots in **~10 ms — roughly 65× faster than merely
+starting an empty Docker container**, and the warm agent is already doing useful
+work (capability negotiation + first turn) while the container has only just
+reached its entrypoint. Absolute numbers vary by hardware; run `make bench` to
+reproduce on yours.
+
 ## Design in one screen
 
 - **Transport.** One imported function, `latigo_abi.hostcall`, carries length-
@@ -64,11 +100,6 @@ make test
   termination); virtual bash + VFS (`mvdan/sh` + `afero`); skills as on-demand
   markdown; Starlark script tools with step/output budgets; tool catalog
   received from the host.
-
-## Non-goals
-
-No direct network or disk access, no nested WASM, and no orchestration concepts
-(leases, tenants) in the ABI.
 
 ## Requirements
 

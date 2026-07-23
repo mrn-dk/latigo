@@ -1,7 +1,7 @@
 GUEST_WASM ?= latigo.wasm
 GOAL ?= Explore the workspace and report what you find.
 
-.PHONY: all guest host test conformance run replay clean fmt vet
+.PHONY: all guest host bench test conformance run replay clean fmt vet
 
 all: guest host
 
@@ -12,6 +12,10 @@ guest:
 ## host: build the reference local host CLI
 host:
 	go build -o latigo-local ./cmd/latigo-local
+
+## bench: measure agent spin-up performance (add DOCKER=1 for the Docker baseline)
+bench: guest
+	go run ./cmd/latigo-bench -wasm $(GUEST_WASM) -n 300 -cold-n 20 $(if $(DOCKER),-docker,)
 
 ## test: run the full test suite (includes a real wasm run + replay)
 test:
@@ -36,5 +40,5 @@ vet:
 	go vet ./...
 
 clean:
-	rm -f $(GUEST_WASM) latigo-local latigo.events.jsonl
+	rm -f $(GUEST_WASM) latigo-local latigo-bench latigo.events.jsonl
 	rm -rf workspace
