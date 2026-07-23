@@ -45,7 +45,32 @@ when an optional capability is absent (e.g. no `approval` capability means every
 action is treated as pre-approved).
 
 Required operations are always present on a conformant host. Optional
-capabilities are `exec`, `approval`, and `fs_write`.
+capabilities are `http`, `exec`, `approval`, and `fs_write`.
+
+### Trust tiers and the single-egress rule
+
+Capabilities fall into two trust tiers:
+
+- **Governed** (`fs.*`, `http.fetch`, `llm.call`, `tool.*`, `msg.*`, …): every
+  effect is mediated by the host, policy-gated, and recorded, so it is
+  deterministic and replay-safe. This is the sandbox guarantee.
+- **Ambient** (`exec.run`): runs native code carrying the host's own OS
+  authority (network, filesystem, environment), which the ABI cannot govern from
+  inside the guest.
+
+The rule that keeps these coherent:
+
+> **There is exactly one governed network egress: `http.fetch`. Any capability
+> that can execute ambient code (`exec.run`) must be sandboxed by the host at
+> least as strictly as `http.fetch`, or it forfeits the safety guarantee.**
+
+Consequently the reference `exec.run` (`host.LocalExec`) is deny-by-default:
+it requires an explicit `argv[0]` allowlist, never inherits or accepts
+guest-supplied environment, and **network-isolates the child unless the operator
+explicitly opts into unsafe networked exec** (failing closed where isolation is
+unavailable). Whenever `exec` is granted, the negotiated capabilities set
+`ambient: true`, which is written into the `run_start` event so the escalation
+is permanently auditable.
 
 ## Operations
 
@@ -54,7 +79,8 @@ capabilities are `exec`, `approval`, and `fs_write`.
 | `fs` | `fs.read`, `fs.write`, `fs.list`, `fs.stat`, `fs.remove`, `fs.mkdir` | yes | Host filesystem, sandboxed by the host |
 | `llm` | `llm.call` | yes | OpenAI-compatible chat completion with tools |
 | `tool` | `tool.list`, `tool.invoke` | yes | Runtime-agnostic tool catalog; routing is the host's business |
-| `exec` | `exec.run` | optional | Native process execution |
+| `http` | `http.fetch` | optional | Governed HTTP(S) egress: the single sanctioned path to the network, allowlisted and SSRF-guarded by the host |
+| `exec` | `exec.run` | optional | Native process execution (ambient; see the single-egress rule above) |
 | `msg` | `msg.send`, `msg.recv` | yes | Messaging to/from the outside world |
 | `approval` | `approval.await` | optional | Human-in-the-loop gating |
 | `log` | `log.append` | yes | Structured logging |
@@ -69,6 +95,13 @@ Request/response payloads for every op are defined in
 `clock.now` and `rand.bytes` are hostcalls precisely so their results are
 captured in the event log. The guest never reads a real clock or entropy source
 directly. Replay returns the recorded values, so a run is fully reconstructable.
+
+`http.fetch` is likewise a **recorded side effect**: its response (status,
+headers, body) is written to the log before the guest observes it and returned
+verbatim on replay, so a replayed run never touches the network. Two *live* runs
+may see different responses, but any single run is deterministically
+reconstructable. This is also why networking is `http.fetch` and not raw
+sockets — a request/response op can be recorded and replayed; a socket cannot.
 
 ## Conformance
 

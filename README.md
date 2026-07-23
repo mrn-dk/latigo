@@ -39,7 +39,30 @@ make guest host
 # Use a real OpenAI-compatible endpoint (or Mortise):
 OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_API_KEY=sk-... \
   ./latigo-local -wasm latigo.wasm -model gpt-4o-mini "summarise README"
+
+# Grant governed network access: curl / the http_fetch tool, allowlisted per host.
+./latigo-local -wasm latigo.wasm -http -http-allow 'api.github.com,*.example.com' \
+  "fetch https://api.github.com/zen and report it"
 ```
+
+## Networking
+
+The guest has **no ambient network access**. The only way out is the governed
+`http.fetch` capability, which the host must explicitly grant and which it
+mediates on every request: scheme/method/host allowlisting, SSRF defence
+(private, loopback, and cloud-metadata addresses are blocked, with the resolved
+IP pinned to defeat DNS rebinding), a response-size cap, and request-header
+stripping. In the guest this surfaces as `curl`/`wget` in the virtual shell and
+an `http_fetch` tool — both thin wrappers over the one governed hostcall, so the
+*host* decides where requests may go, not the model. Because it is a hostcall,
+every response is recorded and replay-safe.
+
+`exec.run` (native process execution) is a separate, deny-by-default **ambient**
+capability that escapes these guarantees, so the reference host keeps it from
+becoming an ungoverned second egress: it requires an explicit command allowlist,
+never inherits the host environment, and network-isolates the child unless you
+opt into unsafe networked exec. Enabling it stamps the run as `ambient` in the
+event log. See [docs/ABI.md](docs/ABI.md#trust-tiers-and-the-single-egress-rule).
 
 Run everything (including a real wasm run + replay integration test):
 
