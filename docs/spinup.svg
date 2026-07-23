@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="384" viewBox="0 0 760 384" font-family="-apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <rect width="760" height="384" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="30" y="34" font-size="19" font-weight="700" fill="#0f172a">Agent spin-up time (p50, log scale)</text>
+  <text x="30" y="54" font-size="12.5" fill="#64748b">Lower is better &#183; x86-64 Linux, Go 1.25, wazero 1.12, 9.0&#8201;MB guest module</text>
+
+  <!-- Gridlines + axis labels: 1ms .. 10s over plot x=250..710 -->
+  <g stroke="#e2e8f0" stroke-width="1">
+    <line x1="250" y1="72" x2="250" y2="300"/>
+    <line x1="365" y1="72" x2="365" y2="300"/>
+    <line x1="480" y1="72" x2="480" y2="300"/>
+    <line x1="595" y1="72" x2="595" y2="300"/>
+    <line x1="710" y1="72" x2="710" y2="300"/>
+  </g>
+  <g font-size="11" fill="#94a3b8" text-anchor="middle">
+    <text x="250" y="318">1&#8201;ms</text>
+    <text x="365" y="318">10&#8201;ms</text>
+    <text x="480" y="318">100&#8201;ms</text>
+    <text x="595" y="318">1&#8201;s</text>
+    <text x="710" y="318">10&#8201;s</text>
+  </g>
+
+  <!-- Bars: x0=250 (=1ms), width = log10(ms)/4 * 460 -->
+  <g font-size="12.5" fill="#0f172a" text-anchor="end">
+    <text x="238" y="93">spin-up: warm (per agent)</text>
+    <text x="238" y="135">cold start (cached compile)</text>
+    <text x="238" y="177">docker run --rm alpine true</text>
+    <text x="238" y="219">cold start (compile + spin-up)</text>
+    <text x="238" y="261">compile (one-time)</text>
+  </g>
+
+  <!-- warm: 10 ms -> 115px (green highlight) -->
+  <rect x="250" y="72" width="115" height="26" rx="3" fill="#16a34a"/>
+  <text x="373" y="90" font-size="12.5" font-weight="700" fill="#16a34a">10&#8201;ms</text>
+
+  <!-- cached cold: 87 ms -> 223px -->
+  <rect x="250" y="114" width="223" height="26" rx="3" fill="#4ade80"/>
+  <text x="481" y="132" font-size="12.5" font-weight="700" fill="#16a34a">87&#8201;ms</text>
+
+  <!-- docker: 650 ms -> 323px (baseline) -->
+  <rect x="250" y="156" width="323" height="26" rx="3" fill="#f97316"/>
+  <text x="581" y="174" font-size="12.5" font-weight="700" fill="#c2410c">650&#8201;ms</text>
+
+  <!-- cold compile+spinup: 2548 ms -> 392px (one-time, grey) -->
+  <rect x="250" y="198" width="392" height="26" rx="3" fill="#cbd5e1"/>
+  <text x="650" y="216" font-size="12.5" font-weight="700" fill="#64748b">2.5&#8201;s</text>
+
+  <!-- compile one-time: 2547 ms -> 392px (grey) -->
+  <rect x="250" y="240" width="392" height="26" rx="3" fill="#cbd5e1"/>
+  <text x="650" y="258" font-size="12.5" font-weight="700" fill="#64748b">2.5&#8201;s</text>
+
+  <!-- Callout -->
+  <text x="30" y="344" font-size="12.5" fill="#0f172a"><tspan font-weight="700" fill="#16a34a">~65&#215; faster</tspan> per-agent spin-up than starting an empty Docker container.</text>
+  <text x="30" y="364" font-size="12.5" fill="#64748b">The one-time compile (grey) is paid once per host process, or cached to disk across restarts.</text>
+</svg>
