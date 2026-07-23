@@ -240,6 +240,13 @@ type StateRestoreResponse struct {
 	Found bool `json:"found"`
 	// State is the most recent snapshot blob when Found is true.
 	State RawJSON `json:"state,omitempty"`
+	// Reactivate is true when this is a *new activation* of a parked (completed)
+	// agent rather than a bounded-replay/crash resume of an in-progress run. The
+	// guest clears its terminal state, appends Input as a new user turn, and runs
+	// again with a fresh turn budget.
+	Reactivate bool `json:"reactivate,omitempty"`
+	// Input is the new task/message delivered on a reactivation.
+	Input string `json:"input,omitempty"`
 }
 
 // ----- clock.now / rand.bytes -----

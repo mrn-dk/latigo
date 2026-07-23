@@ -42,9 +42,11 @@ type Host struct {
 	// checkpointing: when enabled, state.checkpoint appends KindCheckpoint
 	// events and state.restore returns resumeState (used to resume a compacted
 	// or interrupted run).
-	checkpointing bool
-	resumeState   json.RawMessage
-	resumeFound   bool
+	checkpointing    bool
+	resumeState      json.RawMessage
+	resumeFound      bool
+	resumeReactivate bool
+	resumeInput      string
 }
 
 // Checkpoints enables the state.checkpoint/state.restore capability. resume, if
@@ -55,6 +57,20 @@ func (h *Host) Checkpoints(resume json.RawMessage) {
 	h.caps.Checkpoint = true
 	h.resumeState = resume
 	h.resumeFound = len(resume) > 0
+}
+
+// Reactivate enables checkpointing and resumes a *parked* (completed) agent from
+// state as a new activation: the guest clears its terminal state, appends input
+// as a new user turn, and runs again with a fresh turn budget. This is the
+// durable-actor wake path — the host stores checkpoint blobs (e.g. in a
+// database) and hands the latest one back here to re-task an agent.
+func (h *Host) Reactivate(state json.RawMessage, input string) {
+	h.checkpointing = true
+	h.caps.Checkpoint = true
+	h.resumeState = state
+	h.resumeFound = len(state) > 0
+	h.resumeReactivate = true
+	h.resumeInput = input
 }
 
 // New builds a Host with the given capabilities and event log.
@@ -141,7 +157,12 @@ func (h *Host) Dispatch(ctx context.Context, reqBytes []byte) []byte {
 			}
 			return encodeResponse(abi.Response{Result: json.RawMessage(`{}`)})
 		case abi.OpStateRestore:
-			resp := abi.StateRestoreResponse{Found: h.resumeFound, State: h.resumeState}
+			resp := abi.StateRestoreResponse{
+				Found:      h.resumeFound,
+				State:      h.resumeState,
+				Reactivate: h.resumeReactivate,
+				Input:      h.resumeInput,
+			}
 			b, _ := json.Marshal(resp)
 			respBytes := encodeResponse(abi.Response{Result: b})
 			if h.log != nil {
