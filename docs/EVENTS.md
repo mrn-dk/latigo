@@ -70,3 +70,26 @@ from.
 
 This is what makes long-running agents practical: the log does not grow without
 bound, and an interrupted run can resume from its last snapshot.
+
+## Durable actors: park & reactivate
+
+Checkpointing also underpins the **durable-actor** lifecycle, where an agent is
+never destroyed — it computes, returns a result, and is *parked* as a checkpoint
+blob the host stores (e.g. in a database) with zero running footprint.
+
+- **Checkpoint on terminate.** When a run finishes, the guest emits a final
+  `state.checkpoint` capturing its completed state (`done`, `summary`, transcript,
+  virtual filesystem). This is the up-to-date blob the host parks. (It is skipped
+  when an activation did no work — e.g. a pure bounded-replay reconstruction —
+  so it never diverges from a compacted journal.)
+- **Reactivation.** To re-task a parked agent, the host resumes it as a *new
+  activation*: `state.restore` returns `reactivate: true` and an `input` string.
+  The guest clears its terminal state, appends `input` as a new user turn, keeps
+  its prior transcript and filesystem, and runs again with a fresh turn budget.
+  The new activation records its own log and, on completion, parks again.
+
+Both flavours of `state.restore` — bounded-replay/crash *resume* (`reactivate:
+false`) and *reactivation* (`reactivate: true`) — are ordinary recorded
+hostcalls, so each activation is independently replayable. Identity, storage of
+blobs, and single-writer scheduling across many agents are host concerns; the
+ABI stays free of leases and tenants.

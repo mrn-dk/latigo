@@ -104,18 +104,31 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	// Resume from a checkpoint when the host offers one (a compacted or
-	// interrupted run); otherwise start fresh. state.restore is always the
-	// guest's second startup hostcall so compaction can rely on its position.
+	// Resume from a checkpoint when the host offers one; otherwise start fresh.
+	// state.restore is always the guest's second startup hostcall so compaction
+	// can rely on its position. Two resume flavours:
+	//   - reactivation: a *new activation* of a parked (completed) agent — clear
+	//     the terminal state, append the new input, run with a fresh budget;
+	//   - resume: a bounded-replay/crash continuation of an in-progress run.
 	startTurn := 0
 	skipCheckpoint := false
 	restored := false
 	if a.cfg.Capabilities.Checkpoint {
 		if st, err := a.client.StateRestore(); err == nil && st.Found {
 			if resumeTurn, ok := a.restore(st.State); ok {
-				startTurn = resumeTurn
-				skipCheckpoint = true // the boundary checkpoint is not re-emitted
 				restored = true
+				if st.Reactivate {
+					a.done = false
+					a.summary = ""
+					if st.Input != "" {
+						a.messages = append(a.messages, abi.LLMMessage{Role: "user", Content: st.Input})
+					}
+					// Fresh turn budget for the new task; keep the transcript.
+					startTurn = 0
+				} else {
+					startTurn = resumeTurn
+					skipCheckpoint = true // the boundary checkpoint is not re-emitted
+				}
 			}
 		}
 	}
@@ -126,10 +139,17 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 		}
 	}
 
-	for turn := startTurn; ; turn++ {
+	// didWork records whether the loop executed at least one turn this
+	// activation. It gates the terminal checkpoint so a pure reconstruction
+	// (restore a completed agent, do nothing) does not re-emit a checkpoint that
+	// would diverge from the recorded/compacted journal.
+	didWork := false
+	turn := startTurn
+	for ; ; turn++ {
 		if a.ShouldStop(a, turn) {
 			break
 		}
+		didWork = true
 		if a.cfg.Capabilities.Checkpoint && !skipCheckpoint && a.ShouldCheckpoint(a, turn) {
 			_ = a.client.StateCheckpoint(a.checkpointState(turn))
 		}
@@ -150,10 +170,11 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 		a.messages = append(a.messages, resp.Message)
 
 		if len(resp.Message.ToolCalls) == 0 {
-			// Model produced a final answer: terminate.
+			// Model produced a final answer: the activation is complete.
 			if a.summary == "" {
 				a.summary = resp.Message.Content
 			}
+			a.done = true
 			break
 		}
 
@@ -171,6 +192,13 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 		if a.done {
 			break
 		}
+	}
+
+	// Checkpoint on terminate: snapshot the completed state so the host can park
+	// the agent with an up-to-date blob and later reactivate it. Skipped when no
+	// work was done this activation (see didWork).
+	if a.cfg.Capabilities.Checkpoint && didWork {
+		_ = a.client.StateCheckpoint(a.checkpointState(turn))
 	}
 	return a.summary, nil
 }
