@@ -37,12 +37,19 @@ type Agent struct {
 // NewAgent constructs an agent from config and a client.
 func NewAgent(cfg Config, client *Client) *Agent {
 	vfs := NewVFS()
+	// Only hand the shell a network fetcher when the host granted the HTTP
+	// capability; otherwise curl/wget report no network rather than issuing a
+	// hostcall that would just fail.
+	var fetch Fetcher
+	if cfg.Capabilities.HTTP {
+		fetch = client
+	}
 	a := &Agent{
 		cfg:    cfg,
 		client: client,
 		tools:  NewRegistry(client),
 		vfs:    vfs,
-		bash:   NewBash(vfs),
+		bash:   NewBash(vfs, fetch),
 		skills: NewSkills(vfs),
 		script: NewScriptRunner(ScriptBudget{}),
 	}
