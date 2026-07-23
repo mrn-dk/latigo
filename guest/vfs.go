@@ -63,4 +63,33 @@ func (v *VFS) Snapshot() map[string]int64 {
 	return out
 }
 
+// SnapshotFull returns a deterministic map of every file path to its full
+// contents. Unlike Snapshot (path->size) this is restorable, so it is what a
+// checkpoint captures.
+func (v *VFS) SnapshotFull() map[string][]byte {
+	out := map[string][]byte{}
+	_ = afero.Walk(v.fs, "/", func(p string, info fs.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		data, rerr := afero.ReadFile(v.fs, p)
+		if rerr == nil {
+			out[p] = data
+		}
+		return nil
+	})
+	return out
+}
+
+// RestoreFull replaces the VFS contents with files, discarding anything already
+// present. It is the inverse of SnapshotFull and is used to resume from a
+// checkpoint.
+func (v *VFS) RestoreFull(files map[string][]byte) {
+	v.fs = afero.NewMemMapFs()
+	_ = v.fs.MkdirAll("/work", 0o755)
+	for p, data := range files {
+		_ = v.WriteFile(p, data)
+	}
+}
+
 func trimNewline(s string) string { return strings.TrimRight(s, "\n") }

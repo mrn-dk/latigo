@@ -32,6 +32,9 @@ type Agent struct {
 	Compact func(a *Agent, msgs []abi.LLMMessage) []abi.LLMMessage
 	// ShouldStop decides whether to terminate after a turn.
 	ShouldStop func(a *Agent, turn int) bool
+	// ShouldCheckpoint decides whether to snapshot durable state at the top of a
+	// turn. Only consulted when the host grants the Checkpoint capability.
+	ShouldCheckpoint func(a *Agent, turn int) bool
 }
 
 // NewAgent constructs an agent from config and a client.
@@ -57,6 +60,9 @@ func NewAgent(cfg Config, client *Client) *Agent {
 	a.ShouldCompact = func(msgs []abi.LLMMessage) bool { return len(msgs) > 40 }
 	a.Compact = defaultCompact
 	a.ShouldStop = func(ag *Agent, turn int) bool { return ag.done || turn >= ag.cfg.MaxTurns }
+	// Snapshot state every few turns so the host can compact the log to a
+	// bounded tail and resume interrupted runs.
+	a.ShouldCheckpoint = func(ag *Agent, turn int) bool { return turn > 0 && turn%4 == 0 }
 	a.registerBuiltins()
 	return a
 }
@@ -81,15 +87,36 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	a.messages = []abi.LLMMessage{
-		{Role: "system", Content: a.SystemPrompt},
-		{Role: "user", Content: a.cfg.Goal},
+	// Resume from a checkpoint when the host offers one (a compacted or
+	// interrupted run); otherwise start fresh. state.restore is always the
+	// guest's second startup hostcall so compaction can rely on its position.
+	startTurn := 0
+	skipCheckpoint := false
+	restored := false
+	if a.cfg.Capabilities.Checkpoint {
+		if st, err := a.client.StateRestore(); err == nil && st.Found {
+			if resumeTurn, ok := a.restore(st.State); ok {
+				startTurn = resumeTurn
+				skipCheckpoint = true // the boundary checkpoint is not re-emitted
+				restored = true
+			}
+		}
+	}
+	if !restored {
+		a.messages = []abi.LLMMessage{
+			{Role: "system", Content: a.SystemPrompt},
+			{Role: "user", Content: a.cfg.Goal},
+		}
 	}
 
-	for turn := 0; ; turn++ {
+	for turn := startTurn; ; turn++ {
 		if a.ShouldStop(a, turn) {
 			break
 		}
+		if a.cfg.Capabilities.Checkpoint && !skipCheckpoint && a.ShouldCheckpoint(a, turn) {
+			_ = a.client.StateCheckpoint(a.checkpointState(turn))
+		}
+		skipCheckpoint = false
 		if a.ShouldCompact(a.messages) {
 			a.messages = a.Compact(a, a.messages)
 		}
@@ -131,16 +158,40 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 	return a.summary, nil
 }
 
-// Checkpoint returns an opaque guest-state snapshot for the durable log.
-func (a *Agent) Checkpoint() json.RawMessage {
-	snap := map[string]any{
-		"messages": a.messages,
-		"files":    a.vfs.Snapshot(),
-		"done":     a.done,
-		"summary":  a.summary,
-	}
-	b, _ := json.Marshal(snap)
+// agentSnapshot is the guest-defined checkpoint blob. It is opaque to the host.
+type agentSnapshot struct {
+	Turn     int               `json:"turn"`
+	Messages []abi.LLMMessage  `json:"messages"`
+	Files    map[string][]byte `json:"files"`
+	Done     bool              `json:"done"`
+	Summary  string            `json:"summary"`
+}
+
+// checkpointState returns an opaque, restorable snapshot of the guest for the
+// durable log, taken at the top of the given turn.
+func (a *Agent) checkpointState(turn int) json.RawMessage {
+	b, _ := json.Marshal(agentSnapshot{
+		Turn:     turn,
+		Messages: a.messages,
+		Files:    a.vfs.SnapshotFull(),
+		Done:     a.done,
+		Summary:  a.summary,
+	})
 	return b
+}
+
+// restore rehydrates the agent from a snapshot and returns the turn to resume
+// at. ok is false if the blob cannot be decoded (the caller then starts fresh).
+func (a *Agent) restore(state json.RawMessage) (int, bool) {
+	var snap agentSnapshot
+	if err := json.Unmarshal(state, &snap); err != nil {
+		return 0, false
+	}
+	a.messages = snap.Messages
+	a.vfs.RestoreFull(snap.Files)
+	a.done = snap.Done
+	a.summary = snap.Summary
+	return snap.Turn, true
 }
 
 func defaultCompact(a *Agent, msgs []abi.LLMMessage) []abi.LLMMessage {

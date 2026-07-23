@@ -143,6 +143,27 @@ func (c *Client) HTTPFetch(req abi.HTTPFetchRequest) (abi.HTTPFetchResponse, err
 	return r, err
 }
 
+// StateCheckpoint pushes an opaque state snapshot to the host. It degrades to a
+// no-op when the host lacks the checkpoint capability.
+func (c *Client) StateCheckpoint(state abi.RawJSON) error {
+	err := c.call(abi.OpStateCheckpoint, abi.StateCheckpointRequest{State: state}, nil)
+	if IsUnsupported(err) {
+		return nil
+	}
+	return err
+}
+
+// StateRestore asks the host for the latest snapshot to resume from. Found is
+// false on a fresh run (or when the capability is absent).
+func (c *Client) StateRestore() (abi.StateRestoreResponse, error) {
+	var r abi.StateRestoreResponse
+	err := c.call(abi.OpStateRestore, abi.StateRestoreRequest{}, &r)
+	if IsUnsupported(err) {
+		return abi.StateRestoreResponse{Found: false}, nil
+	}
+	return r, err
+}
+
 func (c *Client) MsgSend(channel, content string) error {
 	return c.call(abi.OpMsgSend, abi.MsgSendRequest{Channel: channel, Content: content}, nil)
 }

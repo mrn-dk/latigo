@@ -80,12 +80,21 @@ func TestCheckpointRoundTrip(t *testing.T) {
 	client := NewClient(&fakeTransport{})
 	agent := NewAgent(Config{Goal: "g", MaxTurns: 1}, client)
 	_, _ = agent.Run(context.Background())
-	cp := agent.Checkpoint()
-	var snap map[string]any
-	if err := json.Unmarshal(cp, &snap); err != nil {
-		t.Fatalf("checkpoint not valid JSON: %v", err)
+	// Snapshot the agent, then restore it into a fresh agent and confirm the
+	// transcript survives the round-trip.
+	agent.messages = append(agent.messages, abi.LLMMessage{Role: "user", Content: "marker"})
+	_ = agent.vfs.WriteFile("/work/keep.txt", []byte("data"))
+	cp := agent.checkpointState(3)
+
+	restored := NewAgent(Config{Goal: "g", MaxTurns: 1}, client)
+	turn, ok := restored.restore(cp)
+	if !ok || turn != 3 {
+		t.Fatalf("restore returned turn=%d ok=%v, want 3,true", turn, ok)
 	}
-	if _, ok := snap["messages"]; !ok {
-		t.Error("checkpoint missing messages")
+	if len(restored.messages) != len(agent.messages) {
+		t.Errorf("restored %d messages, want %d", len(restored.messages), len(agent.messages))
+	}
+	if data, err := restored.vfs.ReadFile("/work/keep.txt"); err != nil || string(data) != "data" {
+		t.Errorf("restored vfs file = %q err=%v", data, err)
 	}
 }
