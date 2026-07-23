@@ -38,6 +38,23 @@ type Host struct {
 	replay    []events.Hostcall
 	replayIdx int
 	replaying bool
+
+	// checkpointing: when enabled, state.checkpoint appends KindCheckpoint
+	// events and state.restore returns resumeState (used to resume a compacted
+	// or interrupted run).
+	checkpointing bool
+	resumeState   json.RawMessage
+	resumeFound   bool
+}
+
+// Checkpoints enables the state.checkpoint/state.restore capability. resume, if
+// non-nil, is the snapshot returned by the guest's startup state.restore call
+// (e.g. loaded from a prior, possibly compacted, log); pass nil for a fresh run.
+func (h *Host) Checkpoints(resume json.RawMessage) {
+	h.checkpointing = true
+	h.caps.Checkpoint = true
+	h.resumeState = resume
+	h.resumeFound = len(resume) > 0
 }
 
 // New builds a Host with the given capabilities and event log.
@@ -60,16 +77,22 @@ func (h *Host) Capabilities() abi.Capabilities { return h.caps }
 // Handlers are never invoked while replaying; recorded responses are returned
 // verbatim so state is reconstructed rather than re-executed.
 func (h *Host) LoadReplay(evs []events.Event) error {
+	// Checkpoints are not hostcalls, but the guest issues a state.checkpoint at
+	// the same points during replay, so inject a matching synthetic journal
+	// entry (an empty ack) to keep the sequence aligned.
+	ackResp := encodeResponse(abi.Response{Result: json.RawMessage(`{}`)})
 	h.replay = nil
 	for _, ev := range evs {
-		if ev.Kind != events.KindHostcall {
-			continue
+		switch ev.Kind {
+		case events.KindHostcall:
+			var hc events.Hostcall
+			if err := json.Unmarshal(ev.Payload, &hc); err != nil {
+				return err
+			}
+			h.replay = append(h.replay, hc)
+		case events.KindCheckpoint:
+			h.replay = append(h.replay, events.Hostcall{Op: abi.OpStateCheckpoint, Response: ackResp})
 		}
-		var hc events.Hostcall
-		if err := json.Unmarshal(ev.Payload, &hc); err != nil {
-			return err
-		}
-		h.replay = append(h.replay, hc)
 	}
 	h.replaying = len(h.replay) > 0
 	h.replayIdx = 0
@@ -98,6 +121,38 @@ func (h *Host) Dispatch(ctx context.Context, reqBytes []byte) []byte {
 			})
 		}
 		return rec.Response
+	}
+
+	// state.checkpoint / state.restore are handled here (not via the handler
+	// map) so checkpoint bytes land in a KindCheckpoint event rather than being
+	// duplicated into a KindHostcall, and so restore can serve resume state.
+	if h.checkpointing {
+		switch req.Op {
+		case abi.OpStateCheckpoint:
+			var sc abi.StateCheckpointRequest
+			_ = json.Unmarshal(req.Args, &sc)
+			if h.log != nil {
+				if _, err := h.log.Append(events.KindCheckpoint, events.Checkpoint{
+					SinceSeq: h.log.Seq(),
+					State:    sc.State,
+				}); err != nil {
+					return encodeResponse(abi.Response{Error: "durability failure: " + err.Error(), Code: abi.ErrInternal})
+				}
+			}
+			return encodeResponse(abi.Response{Result: json.RawMessage(`{}`)})
+		case abi.OpStateRestore:
+			resp := abi.StateRestoreResponse{Found: h.resumeFound, State: h.resumeState}
+			b, _ := json.Marshal(resp)
+			respBytes := encodeResponse(abi.Response{Result: b})
+			if h.log != nil {
+				if _, err := h.log.Append(events.KindHostcall, events.Hostcall{
+					Op: req.Op, Request: reqBytes, Response: respBytes,
+				}); err != nil {
+					return encodeResponse(abi.Response{Error: "durability failure: " + err.Error(), Code: abi.ErrInternal})
+				}
+			}
+			return respBytes
+		}
 	}
 
 	resp := h.execute(ctx, req)
