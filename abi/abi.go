@@ -109,4 +109,11 @@ const (
 	ErrNotFound    = "not_found"
 	ErrInvalid     = "invalid" // malformed request
 	ErrInternal    = "internal"
+
+	// Classified transient failures, primarily surfaced by llm.call once the
+	// host's own internal retries (see host.LLMRetry) are exhausted. Hosts for
+	// other governed ops may reuse these where they meaningfully apply.
+	ErrRateLimited = "rate_limited" // provider signalled 429 / explicit rate limiting
+	ErrOverloaded  = "overloaded"   // provider signalled 5xx / capacity exhaustion
+	ErrTimeout     = "timeout"      // request timed out or the connection failed
 )
