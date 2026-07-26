@@ -15,6 +15,26 @@ type fakeTransport struct {
 	llmTurns []abi.LLMMessage
 	llmIdx   int
 	log      []string
+
+	// approval.await: approveAll approves every request when true; otherwise
+	// every request is denied with denyReason (default "denied"). approvalCalls
+	// records what was asked, in order.
+	approveAll    bool
+	denyReason    string
+	approvalCalls []approvalCall
+
+	// msg.recv: steerMsgs is served in order, one per call, "" meaning
+	// HasMessage=false for that call; calls beyond len(steerMsgs) also report
+	// HasMessage=false. msgRecvCalls counts every call regardless of channel.
+	steerMsgs    []string
+	steerIdx     int
+	msgRecvCalls int
+}
+
+// approvalCall records one approval.await request observed by fakeTransport.
+type approvalCall struct {
+	Action  string
+	Details json.RawMessage
 }
 
 func (f *fakeTransport) Hostcall(req abi.Request) (abi.Response, error) {
@@ -41,6 +61,29 @@ func (f *fakeTransport) Hostcall(req abi.Request) (abi.Response, error) {
 		return result(abi.LogAppendResponse{})
 	case abi.OpClockNow:
 		return result(abi.ClockNowResponse{UnixNano: 1})
+	case abi.OpApprovalAwait:
+		var r abi.ApprovalAwaitRequest
+		_ = json.Unmarshal(req.Args, &r)
+		f.approvalCalls = append(f.approvalCalls, approvalCall{Action: r.Action, Details: r.Details})
+		if f.approveAll {
+			return result(abi.ApprovalAwaitResponse{Approved: true, Reason: "ok"})
+		}
+		reason := f.denyReason
+		if reason == "" {
+			reason = "denied"
+		}
+		return result(abi.ApprovalAwaitResponse{Approved: false, Reason: reason})
+	case abi.OpMsgRecv:
+		f.msgRecvCalls++
+		if f.steerIdx < len(f.steerMsgs) {
+			msg := f.steerMsgs[f.steerIdx]
+			f.steerIdx++
+			if msg == "" {
+				return result(abi.MsgRecvResponse{HasMessage: false})
+			}
+			return result(abi.MsgRecvResponse{HasMessage: true, Content: msg, Channel: "steer"})
+		}
+		return result(abi.MsgRecvResponse{HasMessage: false})
 	default:
 		return abi.Response{Error: "unsupported", Code: abi.ErrUnsupported}, nil
 	}
@@ -210,5 +253,210 @@ func TestOnLLMErrorRetryReissues(t *testing.T) {
 	}
 	if attempts != 3 {
 		t.Errorf("OnLLMError invoked %d times, want 3", attempts)
+	}
+}
+
+// ----- approval gating -----
+
+func TestApprovalGateGatedVsUngated(t *testing.T) {
+	fetchArgs, _ := json.Marshal(map[string]string{"url": "http://example.com"})
+	readArgs, _ := json.Marshal(map[string]string{"path": "/work/x.txt"})
+	doneArgs, _ := json.Marshal(map[string]string{"summary": "ok"})
+	ft := &fakeTransport{
+		approveAll: true,
+		llmTurns: []abi.LLMMessage{
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "1", Name: "http_fetch", Arguments: string(fetchArgs)}}},
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "2", Name: "read_file", Arguments: string(readArgs)}}},
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "3", Name: "done", Arguments: string(doneArgs)}}},
+		},
+	}
+	client := NewClient(ft)
+	agent := NewAgent(Config{Goal: "g", MaxTurns: 8, Capabilities: abi.Capabilities{Approval: true}}, client)
+	_ = agent.vfs.WriteFile("/work/x.txt", []byte("hi"))
+
+	if _, err := agent.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(ft.approvalCalls) != 1 || ft.approvalCalls[0].Action != "http_fetch" {
+		t.Fatalf("approval calls = %+v, want exactly one for http_fetch", ft.approvalCalls)
+	}
+}
+
+func TestApprovalDenialFeedsBackAndContinues(t *testing.T) {
+	fetchArgs, _ := json.Marshal(map[string]string{"url": "http://example.com"})
+	doneArgs, _ := json.Marshal(map[string]string{"summary": "ok"})
+	ft := &fakeTransport{
+		denyReason: "not allowed",
+		llmTurns: []abi.LLMMessage{
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "1", Name: "http_fetch", Arguments: string(fetchArgs)}}},
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "2", Name: "done", Arguments: string(doneArgs)}}},
+		},
+	}
+	client := NewClient(ft)
+	agent := NewAgent(Config{Goal: "g", MaxTurns: 8, Capabilities: abi.Capabilities{Approval: true}}, client)
+
+	summary, err := agent.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary != "ok" {
+		t.Fatalf("summary = %q, want the run to continue past the denial to completion", summary)
+	}
+	var found bool
+	for _, m := range agent.messages {
+		if m.ToolCallID == "1" {
+			found = true
+			if !strings.Contains(m.Content, "denied by host: not allowed") {
+				t.Errorf("tool result = %q, want a denial message", m.Content)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no tool result recorded for the denied call")
+	}
+}
+
+func TestApprovalGracefulDegradationNoCapability(t *testing.T) {
+	fetchArgs, _ := json.Marshal(map[string]string{"url": "http://example.com"})
+	doneArgs, _ := json.Marshal(map[string]string{"summary": "ok"})
+	ft := &fakeTransport{
+		llmTurns: []abi.LLMMessage{
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "1", Name: "http_fetch", Arguments: string(fetchArgs)}}},
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "2", Name: "done", Arguments: string(doneArgs)}}},
+		},
+	}
+	client := NewClient(ft)
+	// No Approval capability granted: even a gated tool name runs unprompted.
+	agent := NewAgent(Config{Goal: "g", MaxTurns: 8}, client)
+
+	if _, err := agent.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(ft.approvalCalls) != 0 {
+		t.Fatalf("approval calls = %d, want 0 (no approval capability)", len(ft.approvalCalls))
+	}
+}
+
+func TestApprovalGateWriteOutsideWork(t *testing.T) {
+	inside, _ := json.Marshal(map[string]string{"path": "/work/a.txt", "content": "x"})
+	outside, _ := json.Marshal(map[string]string{"path": "/etc/passwd", "content": "x"})
+	if _, _, need := defaultApprovalGate(nil, "write_file", inside); need {
+		t.Error("write_file under /work should not require approval")
+	}
+	if _, _, need := defaultApprovalGate(nil, "write_file", outside); !need {
+		t.Error("write_file outside /work should require approval")
+	}
+}
+
+// ----- steering -----
+
+func TestSteerInjectsMessageAtNextTurn(t *testing.T) {
+	bashArgs, _ := json.Marshal(map[string]string{"script": "true"})
+	doneArgs, _ := json.Marshal(map[string]string{"summary": "ok"})
+	ft := &fakeTransport{
+		steerMsgs: []string{"focus on X"},
+		llmTurns: []abi.LLMMessage{
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "1", Name: "bash", Arguments: string(bashArgs)}}},
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "2", Name: "done", Arguments: string(doneArgs)}}},
+		},
+	}
+	client := NewClient(ft)
+	agent := NewAgent(Config{Goal: "g", MaxTurns: 8, Capabilities: abi.Capabilities{Steer: true}}, client)
+
+	if _, err := agent.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ft.msgRecvCalls == 0 {
+		t.Fatal("expected msg.recv to be polled")
+	}
+	var found bool
+	for _, m := range agent.messages {
+		if m.Role == "user" && m.Content == "focus on X" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("steering message not injected; messages=%+v", agent.messages)
+	}
+}
+
+func TestSteerStopEndsRunGracefully(t *testing.T) {
+	ft := &fakeTransport{
+		steerMsgs: []string{"/stop"},
+		llmTurns: []abi.LLMMessage{
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "1", Name: "bash", Arguments: `{"script":"true"}`}}},
+		},
+	}
+	client := NewClient(ft)
+	agent := NewAgent(Config{Goal: "g", MaxTurns: 8, Capabilities: abi.Capabilities{Steer: true}}, client)
+
+	if _, err := agent.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ft.llmIdx != 0 {
+		t.Fatalf("llm.call issued %d times, want 0 (a /stop steer message should preempt the turn)", ft.llmIdx)
+	}
+}
+
+func TestSteerAbsenceIsNoOp(t *testing.T) {
+	bashArgs, _ := json.Marshal(map[string]string{"script": "echo hi > /work/out.txt"})
+	doneArgs, _ := json.Marshal(map[string]string{"summary": "all done"})
+	ft := &fakeTransport{
+		llmTurns: []abi.LLMMessage{
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "1", Name: "bash", Arguments: string(bashArgs)}}},
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "2", Name: "done", Arguments: string(doneArgs)}}},
+		},
+	}
+	client := NewClient(ft)
+	agent := NewAgent(Config{Goal: "g", MaxTurns: 8, Capabilities: abi.Capabilities{Steer: true}}, client)
+
+	summary, err := agent.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary != "all done" {
+		t.Fatalf("summary = %q", summary)
+	}
+	if ft.msgRecvCalls != 2 {
+		t.Fatalf("msg.recv calls = %d, want 2 (one per turn, no message either time)", ft.msgRecvCalls)
+	}
+}
+
+func TestSteerCapabilityOffMeansNoPolling(t *testing.T) {
+	doneArgs, _ := json.Marshal(map[string]string{"summary": "ok"})
+	ft := &fakeTransport{
+		llmTurns: []abi.LLMMessage{
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "1", Name: "done", Arguments: string(doneArgs)}}},
+		},
+	}
+	client := NewClient(ft)
+	// Steer capability not granted (default Config zero value).
+	agent := NewAgent(Config{Goal: "g", MaxTurns: 8}, client)
+
+	if _, err := agent.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ft.msgRecvCalls != 0 {
+		t.Fatalf("msg.recv calls = %d, want 0 (Steer capability not granted)", ft.msgRecvCalls)
+	}
+}
+
+func TestSteerEveryThrottle(t *testing.T) {
+	ft := &fakeTransport{
+		llmTurns: []abi.LLMMessage{
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "1", Name: "bash", Arguments: `{"script":"true"}`}}},
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "2", Name: "bash", Arguments: `{"script":"true"}`}}},
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "3", Name: "done", Arguments: `{"summary":"ok"}`}}},
+		},
+	}
+	client := NewClient(ft)
+	agent := NewAgent(Config{Goal: "g", MaxTurns: 8, Capabilities: abi.Capabilities{Steer: true}}, client)
+	agent.SteerEvery = 2 // poll on turns 0, 2, 4, ...
+
+	if _, err := agent.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ft.msgRecvCalls != 2 {
+		t.Fatalf("msg.recv calls = %d, want 2 (turns 0 and 2 of 3)", ft.msgRecvCalls)
 	}
 }

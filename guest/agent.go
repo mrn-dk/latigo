@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/mrn-dk/latigo/abi"
 )
@@ -58,6 +59,24 @@ type Agent struct {
 	// non-deterministic and break replay); this policy is for graceful
 	// termination, not for waiting out a rate limit.
 	OnLLMError func(a *Agent, err error, turn int) (fallback *abi.LLMMessage, retry bool)
+	// ApprovalGate decides whether a tool call needs host approval before it
+	// runs, returning the action name and details to present plus whether
+	// approval is required at all (need=false means "no approval needed").
+	// Only consulted when the host grants the Approval capability; see
+	// Client.ApprovalAwait for the degrade-to-approved behaviour when it is
+	// absent.
+	ApprovalGate func(a *Agent, name string, args json.RawMessage) (action string, details json.RawMessage, need bool)
+	// Steer decides whether to pull a pending host steering message and how to
+	// inject it into the transcript, consulted at the top of each turn (subject
+	// to SteerEvery) when the host grants the Steer capability. Returning
+	// inject != nil appends it as a message before the turn proceeds; stop=true
+	// requests graceful termination (e.g. the default's "/stop" sentinel).
+	Steer func(a *Agent) (inject *abi.LLMMessage, stop bool)
+	// SteerEvery throttles how often Steer is consulted when the Steer
+	// capability is granted: every SteerEvery-th turn (default 1, i.e. every
+	// turn). Raise it to shrink the msg.recv hostcall footprint on hosts that
+	// wire a real steering source but don't need per-turn granularity.
+	SteerEvery int
 }
 
 // NewAgent constructs an agent from config and a client.
@@ -97,6 +116,9 @@ func NewAgent(cfg Config, client *Client) *Agent {
 	// bounded tail and resume interrupted runs.
 	a.ShouldCheckpoint = func(ag *Agent, turn int) bool { return turn > 0 && turn%4 == 0 }
 	a.OnLLMError = func(_ *Agent, _ error, _ int) (*abi.LLMMessage, bool) { return nil, false }
+	a.ApprovalGate = defaultApprovalGate
+	a.Steer = defaultSteer
+	a.SteerEvery = 1
 	a.registerBuiltins()
 	return a
 }
@@ -166,6 +188,13 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 		if a.ShouldStop(a, turn) {
 			break
 		}
+		if a.cfg.Capabilities.Steer && a.steerDue(turn) {
+			if inject, stop := a.Steer(a); stop {
+				break
+			} else if inject != nil {
+				a.messages = append(a.messages, *inject)
+			}
+		}
 		didWork = true
 		if a.cfg.Capabilities.Checkpoint && !skipCheckpoint && a.ShouldCheckpoint(a, turn) {
 			_ = a.client.StateCheckpoint(a.checkpointState(turn))
@@ -211,7 +240,23 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 		}
 
 		for _, tc := range resp.Message.ToolCalls {
-			out, isErr := a.tools.Invoke(ctx, tc.Name, json.RawMessage(tc.Arguments))
+			args := json.RawMessage(tc.Arguments)
+			if a.cfg.Capabilities.Approval {
+				if action, details, need := a.ApprovalGate(a, tc.Name, args); need {
+					dec, _ := a.client.ApprovalAwait(action, details)
+					if !dec.Approved {
+						a.messages = append(a.messages, abi.LLMMessage{
+							Role:       "tool",
+							ToolCallID: tc.ID,
+							Name:       tc.Name,
+							Content:    "denied by host: " + dec.Reason,
+						})
+						_ = a.client.LogAppend("info", "tool call denied", mustJSON(map[string]string{"tool": tc.Name}))
+						continue
+					}
+				}
+			}
+			out, isErr := a.tools.Invoke(ctx, tc.Name, args)
 			_ = isErr
 			a.messages = append(a.messages, abi.LLMMessage{
 				Role:       "tool",
@@ -291,4 +336,65 @@ func defaultCompact(a *Agent, msgs []abi.LLMMessage) []abi.LLMMessage {
 func mustJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// steerDue reports whether turn is a multiple of SteerEvery (treating <= 0 as
+// "every turn"). It is a pure function of the (deterministic, checkpointed)
+// turn counter, so it replays identically.
+func (a *Agent) steerDue(turn int) bool {
+	n := a.SteerEvery
+	if n <= 0 {
+		n = 1
+	}
+	return turn%n == 0
+}
+
+// defaultApprovalGate requires approval for the ambient/dangerous surface:
+// exec.run-backed tools (by naming convention, "exec*"), http_fetch, VFS
+// writes that escape /work, and fs-removal tools. Everything else (bash
+// running inside the sandboxed VFS, reads, in-/work writes, skills, scripts)
+// runs unattended.
+func defaultApprovalGate(a *Agent, name string, args json.RawMessage) (string, json.RawMessage, bool) {
+	switch {
+	case name == "http_fetch":
+		return name, args, true
+	case strings.HasPrefix(name, "exec"):
+		return name, args, true
+	case name == "fs_remove", name == "fs.remove", name == "remove_file":
+		return name, args, true
+	case name == "write_file":
+		var in struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal(args, &in) == nil && !underWork(in.Path) {
+			return name, args, true
+		}
+	}
+	return "", nil, false
+}
+
+// underWork reports whether p, resolved relative to /work when not already
+// absolute, stays within the /work sandbox root.
+func underWork(p string) bool {
+	if p == "" {
+		return true
+	}
+	cp := resolve("/work", p)
+	return cp == "/work" || strings.HasPrefix(cp, "/work/")
+}
+
+// defaultSteer non-blockingly polls the "steer" channel and, if a message is
+// pending, either injects it as a user message (so the model sees it next
+// turn) or, for the "/stop" sentinel, requests graceful termination. Absence
+// of a message (or a host that errors/degrades the call) is a no-op.
+func defaultSteer(a *Agent) (*abi.LLMMessage, bool) {
+	resp, err := a.client.MsgRecv("steer", false)
+	if err != nil || !resp.HasMessage {
+		return nil, false
+	}
+	if strings.TrimSpace(resp.Content) == "/stop" {
+		return nil, true
+	}
+	msg := abi.LLMMessage{Role: "user", Content: resp.Content}
+	return &msg, false
 }
