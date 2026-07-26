@@ -260,8 +260,11 @@ turn structure.
 `approval` capability; the default gate requires approval for the
 ambient/dangerous surface — `exec.run`-backed tools, `http_fetch`, VFS writes
 that escape `/work`, and fs-removal tools — everything else (bash inside the
-sandboxed VFS, reads, in-`/work` writes, skills, scripts) runs unattended. A
-denial is **not** fatal: it is fed back to the model as the tool's result
+sandboxed VFS, reads, in-`/work` writes, skills, scripts, plan) runs
+unattended. `edit_file` and `multi_edit` (see "Structured editing and
+planning tools" below) are gated exactly like `write_file`: same check
+(escapes `/work`?) against the same top-level `path` field, since an edit is
+just a more surgical VFS write. A denial is **not** fatal: it is fed back to the model as the tool's result
 (`"denied by host: <reason>"`) and the run continues, giving the model a
 chance to try something else. Because `Client.ApprovalAwait` already degrades
 to "approved" when the `approval` capability is absent, hosts that never call
@@ -296,6 +299,60 @@ struct recorded in the `run_start` event.
 See `cmd/latigo-local/main.go`'s `-approve` (interactive y/n prompts) and
 `-steer` (stdin lines injected as steering messages, `/stop` to end the run)
 flags for a working reference wiring.
+
+### Structured editing and planning tools (in-guest, no hostcalls)
+
+Two built-in tool families (`guest/edit.go`, `guest/plan.go`, registered from
+`guest/builtins.go`'s neighbours `Agent.registerEditTools`/
+`Agent.registerPlanTools`) add no new capability and no new hostcall: both are
+pure computation over the VFS and agent state, so they replay exactly like any
+other deterministic guest logic — there is nothing new for the event log to
+record.
+
+**`edit_file`** does an exact-match string replace on a VFS file: `{path, old,
+new, all}`. `old` must match exactly once — zero matches and ambiguous
+(multiple) matches are both errors, never a guess — unless `all: true`, which
+replaces every occurrence. Empty `old` on a file that doesn't exist yet
+creates it with `new` as its content; empty `new` deletes the matched region.
+The tool result is a unified-diff snippet (`--- a/path` / `+++ b/path` /
+`@@ ... @@` hunks with 3 lines of context) so a host can render or approve the
+change, composing with the multimodal (spec 01) and approval (spec 02)
+machinery already in place — `edit_file` uses plain `Tool.Invoke` (text
+result), not `InvokeRich`, since a diff is exactly the kind of thing that
+reads fine as text.
+
+**`multi_edit`** applies an ordered list of `{old, new}` edits to one file
+atomically: each edit is checked against the result of the previous one, and
+if any edit fails (zero or ambiguous matches) *none* of them are written — the
+implementation builds the result in a local string and only calls
+`VFS.WriteFile` once every edit in the batch has applied cleanly, so a failure
+partway through leaves the file completely untouched rather than needing an
+explicit rollback step.
+
+Both are implemented with a from-scratch line differ (LCS-based hunk
+computation) in `guest/edit.go` — the module carries no third-party diff
+library; see `go.mod`, still four direct dependencies.
+
+**`plan`** (`guest/plan.go`) is a durable todo list: `{"op": "set"|"update"|
+"get", "items": [{id, text, status}]}` with `status` one of `pending`,
+`in_progress`, `done`. `set` replaces the whole list; `update` edits existing
+items by id (validated as an all-or-nothing batch — an unknown id or invalid
+status aborts the whole update, leaving the plan untouched); `get` returns it
+unchanged. The plan lives on `Agent.plan` (`[]guest.PlanItem`) and is folded
+into `agentSnapshot` (`guest/agent.go`) as an `omitempty` `plan` field, so it
+survives `checkpointState`/`restore` — and, critically, an *older* checkpoint
+blob with no `"plan"` key at all still decodes cleanly (unmarshals to a nil
+slice, identical to a run that never touched the tool).
+
+The plan is **pinned into context every turn, not just carried in the
+transcript**: `Agent.messagesForLLM` (consulted by the turn loop instead of
+sending `a.messages` directly) appends a fresh `system`-role reminder
+rendering the current plan checklist to the outgoing `llm.call` request, built
+from `a.plan` on every call. That message is never written into `a.messages`
+itself, so `guest/compaction.go`'s `defaultCompact` — which elides the *middle*
+of `a.messages` under a summary — has nothing belonging to the plan to elide;
+the plan survives long, repeatedly-compacted runs by construction rather than
+by special-casing the compactor.
 
 ## Conformance
 
