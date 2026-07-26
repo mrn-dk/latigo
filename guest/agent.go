@@ -92,7 +92,7 @@ func NewAgent(cfg Config, client *Client) *Agent {
 	a := &Agent{
 		cfg:    cfg,
 		client: client,
-		tools:  NewRegistry(client),
+		tools:  NewRegistry(client, cfg.Capabilities.Multimodal),
 		vfs:    vfs,
 		bash:   NewBash(vfs, fetch),
 		skills: NewSkills(vfs),
@@ -174,7 +174,7 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 	if !restored {
 		a.messages = []abi.LLMMessage{
 			{Role: "system", Content: a.SystemPrompt},
-			{Role: "user", Content: a.cfg.Goal},
+			a.initialUserMessage(),
 		}
 	}
 
@@ -256,14 +256,18 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 					}
 				}
 			}
-			out, isErr := a.tools.Invoke(ctx, tc.Name, args)
+			out, parts, isErr := a.tools.Invoke(ctx, tc.Name, args)
 			_ = isErr
-			a.messages = append(a.messages, abi.LLMMessage{
+			toolMsg := abi.LLMMessage{
 				Role:       "tool",
 				ToolCallID: tc.ID,
 				Name:       tc.Name,
 				Content:    out,
-			})
+			}
+			if len(parts) > 0 {
+				toolMsg.Parts = parts
+			}
+			a.messages = append(a.messages, toolMsg)
 			_ = a.client.LogAppend("info", "tool call", mustJSON(map[string]string{"tool": tc.Name}))
 		}
 		if a.done {
@@ -278,6 +282,32 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 		_ = a.client.StateCheckpoint(a.checkpointState(turn))
 	}
 	return a.summary, nil
+}
+
+// initialUserMessage builds the first user turn from the configured goal and
+// any images the host attached to it (e.g. via latigo-local's -image flag,
+// delivered through Config.Images — see LoadConfig). When no images are
+// attached this is just {Role:"user", Content: goal}, identical to
+// pre-multimodal behaviour. When images are present, Content stays populated
+// as the text shorthand (harmless/ignored once Parts is set) and Parts
+// becomes authoritative: a leading text part for the goal (when non-empty)
+// followed by one image part per attachment, degraded per the negotiated
+// Multimodal capability so a text-only host never sees an image part.
+func (a *Agent) initialUserMessage() abi.LLMMessage {
+	msg := abi.LLMMessage{Role: "user", Content: a.cfg.Goal}
+	if len(a.cfg.Images) == 0 {
+		return msg
+	}
+	parts := make([]abi.ContentPart, 0, len(a.cfg.Images)+1)
+	if a.cfg.Goal != "" {
+		parts = append(parts, abi.ContentPart{Type: "text", Text: a.cfg.Goal})
+	}
+	for i := range a.cfg.Images {
+		img := a.cfg.Images[i]
+		parts = append(parts, abi.ContentPart{Type: "image", Image: &img})
+	}
+	msg.Parts = sanitizeContentParts(parts, a.cfg.Capabilities.Multimodal)
+	return msg
 }
 
 // agentSnapshot is the guest-defined checkpoint blob. It is opaque to the host.

@@ -27,6 +27,15 @@ func estimateTokens(msgs []abi.LLMMessage) int {
 		for _, tc := range m.ToolCalls {
 			n += len(tc.Name) + len(tc.Arguments)
 		}
+		for _, p := range m.Parts {
+			n += len(p.Text)
+			if p.Image != nil {
+				// Data is base64-inflated on the wire (~4/3), and this is a
+				// budget heuristic, not an exact count, so approximate
+				// directly against the raw byte length.
+				n += len(p.Image.Data) + len(p.Image.URL) + len(p.Image.MediaType)
+			}
+		}
 		total += n + 16 // framing/role overhead per message
 	}
 	return total / bytesPerToken
