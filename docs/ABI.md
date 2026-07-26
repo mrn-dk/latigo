@@ -55,8 +55,8 @@ when an optional capability is absent (e.g. no `approval` capability means every
 action is treated as pre-approved).
 
 Required operations are always present on a conformant host. Optional
-capabilities are `http`, `checkpoint`, `exec`, `approval`, `steer`, and
-`fs_write`.
+capabilities are `http`, `checkpoint`, `exec`, `approval`, `steer`, `fs_write`,
+and `multimodal`.
 
 ### Trust tiers and the single-egress rule
 
@@ -114,6 +114,95 @@ verbatim on replay, so a replayed run never touches the network. Two *live* runs
 may see different responses, but any single run is deterministically
 reconstructable. This is also why networking is `http.fetch` and not raw
 sockets — a request/response op can be recorded and replayed; a socket cannot.
+
+### Multimodal content (images)
+
+Messages and tool results are not limited to plain text. [`abi.LLMMessage`](../abi/messages.go)
+carries `Content string` (the text shorthand, always populated for text-only
+messages) alongside an optional `Parts []ContentPart`:
+
+```go
+type ContentPart struct {
+    Type  string     `json:"type"`            // "text" | "image"
+    Text  string     `json:"text,omitempty"`
+    Image *ImageData `json:"image,omitempty"`
+}
+
+type ImageData struct {
+    MediaType string `json:"media_type"` // e.g. "image/png"
+    Data      []byte `json:"data,omitempty"`
+    URL       string `json:"url,omitempty"`
+}
+```
+
+`Parts` is `omitempty`: a text-only message serialises identically to before
+this capability existed, so old event logs and hosts that never construct a
+`Parts` slice are completely unaffected. When `Parts` is non-empty it is
+authoritative — it is what actually gets sent to the model; `Content` is not
+also re-emitted alongside it. `abi.ToolInvokeResponse` gains the same `Parts`
+field so a tool can attach structured content (e.g. an image) to its result.
+
+**Capability gate.** A host advertises `Capabilities.Multimodal` only when the
+configured model actually accepts images; `Negotiate` ANDs it like the other
+optional capabilities. The guest **must never** emit an image part to a
+non-multimodal host: `guest.Registry.Invoke` and the agent's initial-turn
+message construction both run every `Parts` slice through a shared
+degradation policy that drops each image part and substitutes a text
+placeholder (`"[image omitted: host is not multimodal]"`) whenever
+`Capabilities.Multimodal` is false. A tool author (or the host) never needs to
+check the capability themselves — attach whatever images you want; the guest
+degrades unconditionally.
+
+**Guest surface.** `guest.Tool.Invoke` keeps its existing
+`func(ctx, args) (string, error)` signature untouched (every built-in still
+implements only this). A tool that wants to return structured content sets
+the new, optional `Tool.InvokeRich func(ctx, args) (RichResult, error)` field
+instead, where `RichResult{Text string; Parts []abi.ContentPart}`;
+`Registry.Invoke` prefers `InvokeRich` when set. The built-in `attach_image`
+tool (`guest/builtins.go`) uses this to read a file from the VFS and attach it
+as an image part to its tool result. The agent's initial user turn can also
+carry host-attached images (`guest.Config.Images`, populated from the
+`LATIGO_GOAL_IMAGES` environment variable — the same instantiation-time
+mechanism `LATIGO_CAPABILITIES` uses), which `latigo-local`'s repeatable
+`-image path.png` flag populates.
+
+**Host translation.** `host/llm.go` is the only place that knows the wire
+dialect. The reference `LLMClient` speaks OpenAI's `/chat/completions`
+format, where a message's `content` is either a plain string or an array of
+typed parts (`{"type":"text",...}` / `{"type":"image_url","image_url":{"url":...}}`,
+the URL being either an `https://` URL or a `data:<media-type>;base64,...`
+URI for inline bytes). This mapping is `oaiContentParts`
+(`[]abi.ContentPart -> []oaiContentPart`), a small, separately unit-tested
+pure function — deliberately factored so that a second wire dialect
+(Anthropic's `messages` API, which also represents content as an array of
+typed parts, just with `{"type":"image","source":{...}}` instead of
+`image_url`) is a sibling function and a table test away. No Anthropic client
+exists in this repo yet; only the OpenAI dialect is implemented.
+
+**Log size.** Because the agent loop resends the entire transcript on every
+turn and the host's write-ahead durability records each `llm.call` request
+verbatim *before* any host-side processing runs, an oversized image attached
+early in a run gets re-logged in full on every subsequent turn — there is no
+way to shrink it back out of the log afterwards without breaking replay.
+`host.CapImage` (`host/image.go`) is the mitigation: given an `ImageData` and
+a byte budget, it downscales (nearest-neighbour resize, re-encoded as JPEG at
+shrinking quality) until the image fits, or returns an error ("reject") if it
+cannot be decoded or brought under budget within a bounded number of
+attempts. It uses only `image`/`image/png`/`image/jpeg`/`image/gif` from the
+standard library — no third-party image dependency. `latigo-local` applies it
+(`host.DefaultMaxImageBytes`, 2 MiB) to every `-image` attachment before it
+ever becomes part of a guest message. This does not (yet) address the
+narrower case the spec calls out of `state.checkpoint` snapshots inlining the
+full message history, images included, every few turns — a complete fix
+would have the guest store images as VFS-path references in checkpoint blobs
+rather than inline bytes; that is not implemented here.
+
+**Determinism & replay.** Images are ordinary bytes inside a message; once
+part of `a.messages` they flow through the existing `llm.call` write-ahead
+recording like any other request content, so replay reconstructs them
+verbatim with no special-casing — see `cmd/latigo-local/image_test.go` for an
+end-to-end check that a `-image` attachment lands in the recorded `llm.call`
+request bytes.
 
 ### `llm.call` retry and rate-limit handling
 
