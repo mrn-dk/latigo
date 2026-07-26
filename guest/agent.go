@@ -24,6 +24,12 @@ type Agent struct {
 	messages []abi.LLMMessage
 	done     bool
 	summary  string
+	// plan is the durable task list maintained by the "plan" built-in
+	// (guest/plan.go). It is included in the checkpoint snapshot and pinned
+	// into the LLM request fresh every turn (see messagesForLLM) rather than
+	// living in messages, so guest/compaction.go's transcript elision never
+	// touches it.
+	plan []PlanItem
 
 	// Strategy points (overridable).
 	SystemPrompt string
@@ -120,6 +126,8 @@ func NewAgent(cfg Config, client *Client) *Agent {
 	a.Steer = defaultSteer
 	a.SteerEvery = 1
 	a.registerBuiltins()
+	a.registerEditTools()
+	a.registerPlanTools()
 	return a
 }
 
@@ -207,7 +215,7 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 		callLLM := func() (abi.LLMCallResponse, error) {
 			return a.client.LLMCall(abi.LLMCallRequest{
 				Model:     a.cfg.Model,
-				Messages:  a.messages,
+				Messages:  a.messagesForLLM(),
 				Tools:     a.tools.Specs(),
 				MaxTokens: a.cfg.Capabilities.MaxLLMTokens,
 			})
@@ -310,6 +318,26 @@ func (a *Agent) initialUserMessage() abi.LLMMessage {
 	return msg
 }
 
+// messagesForLLM returns the transcript to send the model this turn: the
+// persisted transcript (a.messages — what checkpointing and Compact operate
+// on) plus a pinned plan reminder appended fresh whenever a plan is set. The
+// reminder is synthesized from a.plan on every call and never stored in
+// a.messages itself, so defaultCompact (guest/compaction.go) has nothing to
+// elide it from — the current plan survives compaction by construction, not
+// by special-casing the compactor.
+func (a *Agent) messagesForLLM() []abi.LLMMessage {
+	if len(a.plan) == 0 {
+		return a.messages
+	}
+	out := make([]abi.LLMMessage, len(a.messages), len(a.messages)+1)
+	copy(out, a.messages)
+	out = append(out, abi.LLMMessage{
+		Role:    "system",
+		Content: "Current plan (pinned; use the plan tool to update it):\n" + renderPlan(a.plan),
+	})
+	return out
+}
+
 // agentSnapshot is the guest-defined checkpoint blob. It is opaque to the host.
 type agentSnapshot struct {
 	Turn     int               `json:"turn"`
@@ -317,6 +345,11 @@ type agentSnapshot struct {
 	Files    map[string][]byte `json:"files"`
 	Done     bool              `json:"done"`
 	Summary  string            `json:"summary"`
+	// Plan is the durable task list (see guest/plan.go). omitempty so
+	// checkpoint blobs written before this field existed still decode: an
+	// absent "plan" key unmarshals to a nil slice, identical to a run that
+	// never touched the plan tool.
+	Plan []PlanItem `json:"plan,omitempty"`
 }
 
 // checkpointState returns an opaque, restorable snapshot of the guest for the
@@ -328,6 +361,7 @@ func (a *Agent) checkpointState(turn int) json.RawMessage {
 		Files:    a.vfs.SnapshotFull(),
 		Done:     a.done,
 		Summary:  a.summary,
+		Plan:     a.plan,
 	})
 	return b
 }
@@ -343,6 +377,7 @@ func (a *Agent) restore(state json.RawMessage) (int, bool) {
 	a.vfs.RestoreFull(snap.Files)
 	a.done = snap.Done
 	a.summary = snap.Summary
+	a.plan = snap.Plan
 	return snap.Turn, true
 }
 
@@ -381,8 +416,12 @@ func (a *Agent) steerDue(turn int) bool {
 
 // defaultApprovalGate requires approval for the ambient/dangerous surface:
 // exec.run-backed tools (by naming convention, "exec*"), http_fetch, VFS
-// writes that escape /work, and fs-removal tools. Everything else (bash
-// running inside the sandboxed VFS, reads, in-/work writes, skills, scripts)
+// writes that escape /work, and fs-removal tools. edit_file and multi_edit
+// (guest/edit.go) are VFS writes just like write_file — same path field, same
+// /work sandbox check — so they are gated identically: an edit that stays
+// under /work runs unattended, one that would touch a path outside /work
+// requires approval exactly as write_file does. Everything else (bash running
+// inside the sandboxed VFS, reads, in-/work writes, skills, scripts, plan)
 // runs unattended.
 func defaultApprovalGate(a *Agent, name string, args json.RawMessage) (string, json.RawMessage, bool) {
 	switch {
@@ -392,7 +431,7 @@ func defaultApprovalGate(a *Agent, name string, args json.RawMessage) (string, j
 		return name, args, true
 	case name == "fs_remove", name == "fs.remove", name == "remove_file":
 		return name, args, true
-	case name == "write_file":
+	case name == "write_file", name == "edit_file", name == "multi_edit":
 		var in struct {
 			Path string `json:"path"`
 		}
