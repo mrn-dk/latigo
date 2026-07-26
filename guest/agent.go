@@ -42,6 +42,22 @@ type Agent struct {
 	// ShouldCheckpoint decides whether to snapshot durable state at the top of a
 	// turn. Only consulted when the host grants the Checkpoint capability.
 	ShouldCheckpoint func(a *Agent, turn int) bool
+	// OnLLMError decides how to handle an llm.call that failed after the
+	// host's own internal retries were exhausted (see host.LLMRetry) — this is
+	// a terminal failure as far as the guest is concerned. Return retry=true
+	// to re-issue the call (rare; the host already retried internally with
+	// backoff), a non-nil fallback assistant message to inject in place of the
+	// model's turn (letting the run terminate gracefully with that message as
+	// the summary), or (nil, false) to abort. The default returns (nil,
+	// false), which preserves the pre-existing behaviour of aborting the run
+	// with a wrapped "llm.call: ..." error — nothing changes unless a host
+	// opts in by overriding this field.
+	//
+	// Deliberately excluded: guest-side sleeping. Backoff must live entirely
+	// in the host handler (wall-clock waiting driven by the guest would be
+	// non-deterministic and break replay); this policy is for graceful
+	// termination, not for waiting out a rate limit.
+	OnLLMError func(a *Agent, err error, turn int) (fallback *abi.LLMMessage, retry bool)
 }
 
 // NewAgent constructs an agent from config and a client.
@@ -80,6 +96,7 @@ func NewAgent(cfg Config, client *Client) *Agent {
 	// Snapshot state every few turns so the host can compact the log to a
 	// bounded tail and resume interrupted runs.
 	a.ShouldCheckpoint = func(ag *Agent, turn int) bool { return turn > 0 && turn%4 == 0 }
+	a.OnLLMError = func(_ *Agent, _ error, _ int) (*abi.LLMMessage, bool) { return nil, false }
 	a.registerBuiltins()
 	return a
 }
@@ -158,14 +175,29 @@ func (a *Agent) Run(ctx context.Context) (string, error) {
 			a.messages = a.Compact(a, a.messages)
 		}
 
-		resp, err := a.client.LLMCall(abi.LLMCallRequest{
-			Model:     a.cfg.Model,
-			Messages:  a.messages,
-			Tools:     a.tools.Specs(),
-			MaxTokens: a.cfg.Capabilities.MaxLLMTokens,
-		})
-		if err != nil {
-			return "", fmt.Errorf("llm.call: %w", err)
+		callLLM := func() (abi.LLMCallResponse, error) {
+			return a.client.LLMCall(abi.LLMCallRequest{
+				Model:     a.cfg.Model,
+				Messages:  a.messages,
+				Tools:     a.tools.Specs(),
+				MaxTokens: a.cfg.Capabilities.MaxLLMTokens,
+			})
+		}
+		resp, err := callLLM()
+		for err != nil {
+			// The host already retried internally (host.LLMRetry); this is a
+			// terminal failure. OnLLMError decides whether to abort (default),
+			// re-issue, or degrade to a fallback message.
+			fallback, retry := a.OnLLMError(a, err, turn)
+			if retry {
+				resp, err = callLLM()
+				continue
+			}
+			if fallback == nil {
+				return "", fmt.Errorf("llm.call: %w", err)
+			}
+			resp = abi.LLMCallResponse{Message: *fallback, FinishReason: "stop"}
+			err = nil
 		}
 		a.messages = append(a.messages, resp.Message)
 

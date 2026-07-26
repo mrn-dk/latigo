@@ -33,7 +33,17 @@ sig:    (reqPtr i32, reqLen i32, respPtr i32, respCap i32) -> i32
 The `Request` envelope is `{ "op": "<namespace.op>", "args": <json> }`. The
 `Response` envelope is `{ "result": <json> }` on success or
 `{ "error": "...", "code": "..." }` on failure. Stable error codes:
-`unsupported`, `denied`, `not_found`, `invalid`, `internal`.
+`unsupported`, `denied`, `not_found`, `invalid`, `internal`, `rate_limited`,
+`overloaded`, `timeout`.
+
+The last three are *classified transient failures*: `rate_limited` (provider
+signalled 429 / explicit rate limiting), `overloaded` (provider signalled 5xx
+/ capacity exhaustion), and `timeout` (the request timed out or the
+connection failed). They let a caller distinguish "the provider is
+struggling right now" from a hard failure, without parsing free-text error
+messages. A failed `Response` may also carry a `result` payload alongside
+`error`/`code` — an operation-specific advisory hint (e.g. `llm.call`'s
+`retry_after_ms`); most operations never set it.
 
 ## Capability negotiation
 
@@ -103,6 +113,49 @@ verbatim on replay, so a replayed run never touches the network. Two *live* runs
 may see different responses, but any single run is deterministically
 reconstructable. This is also why networking is `http.fetch` and not raw
 sockets — a request/response op can be recorded and replayed; a socket cannot.
+
+### `llm.call` retry and rate-limit handling
+
+Providers routinely rate-limit and blip (`429`, `5xx`, dropped connections).
+Robustness for this lives almost entirely on the **host** side, below the
+durability boundary:
+
+- The reference `host.LLMClient` (`host/llm.go`) retries internally with
+  bounded exponential backoff and jitter, honouring a `Retry-After` header
+  when the provider sends one. This is configured via an `LLMRetry` struct
+  (`MaxAttempts`, `BaseDelay`, `MaxDelay`, `MaxTotalWait`, `RetryOn`) on the
+  client; a zero-value `LLMRetry` means exactly one attempt (today's pre-retry
+  behaviour), so existing hosts that construct an `LLMClient` literal instead
+  of using `NewLLMClient` are unaffected.
+- Both attempts *and total wait* are bounded. A `Retry-After` longer than the
+  client would otherwise wait is honoured rather than second-guessed, but
+  `MaxTotalWait` (60s by default) caps the cumulative sleep: if the next wait
+  would exceed the budget, the call gives up immediately and returns the
+  classified error plus the `retry_after_ms` hint, letting the caller decide.
+  This is what stops a hostile or misconfigured `Retry-After: 86400` from
+  parking a run for a day. Backoff waits are also cancellable — a cancelled
+  context cuts the wait short instead of sitting it out.
+- Because every retry happens *inside* the `llm.call` handler, a single
+  hostcall still produces **exactly one** recorded event. Retries are
+  invisible to the event log and to replay — this is the key determinism
+  property: replaying a run that hit a transient rate limit and then
+  succeeded reconstructs the same single `llm.call` result, regardless of how
+  many attempts happened live.
+- When the host's retries are exhausted, the failure is surfaced as a
+  classified error (`rate_limited`, `overloaded`, or `timeout` — see above)
+  instead of the generic `internal`, so a caller can tell a transient
+  provider hiccup from a hard failure. An advisory `retry_after_ms` hint may
+  accompany the failure when the provider supplied one.
+- The guest loop (`guest/agent.go`) has a small, overridable `OnLLMError`
+  strategy point for *terminal* `llm.call` failures (i.e. after the host has
+  already retried): a host can opt into returning a fallback assistant
+  message (to terminate the run gracefully with a clear "stopping: provider
+  unavailable" summary) or asking the guest to re-issue the call once more.
+  The default aborts the run with a wrapped error, identical to the
+  pre-existing behaviour — nothing changes unless a host opts in.
+- Guest-side wall-clock backoff is deliberately **not** supported: sleeping
+  driven by the guest would be non-deterministic and break replay. Backoff
+  lives entirely in the host handler; the guest only ever sees the outcome.
 
 ## Conformance
 

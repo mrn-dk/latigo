@@ -44,13 +44,17 @@ func (c *Client) call(op abi.Op, args any, out any) error {
 	if err != nil {
 		return err
 	}
-	if resp.Error != "" {
-		return &HostError{Op: op, Code: resp.Code, Message: resp.Error}
-	}
+	// Decode Result opportunistically even on a failed call: some ops (e.g.
+	// llm.call) attach an advisory hint, such as a retry-after duration,
+	// alongside a non-empty Error. A malformed Result is not itself fatal when
+	// the call already failed for another reason.
 	if out != nil && len(resp.Result) > 0 {
-		if err := json.Unmarshal(resp.Result, out); err != nil {
+		if err := json.Unmarshal(resp.Result, out); err != nil && resp.Error == "" {
 			return fmt.Errorf("latigo: decode %s result: %w", op, err)
 		}
+	}
+	if resp.Error != "" {
+		return &HostError{Op: op, Code: resp.Code, Message: resp.Error}
 	}
 	return nil
 }

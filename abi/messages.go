@@ -101,6 +101,13 @@ type LLMCallResponse struct {
 	FinishReason string     `json:"finish_reason"`
 	InputTokens  int        `json:"input_tokens"`
 	OutputTokens int        `json:"output_tokens"`
+	// RetryAfterMS is an advisory hint, in milliseconds, for how long a caller
+	// should wait before trying again. It is populated by the host on
+	// rate_limited/overloaded failures when the provider supplied a
+	// Retry-After; zero when no hint is known. Present even alongside a
+	// non-empty Response.Error, so a host wrapper can surface it without
+	// waiting for a successful call.
+	RetryAfterMS int `json:"retry_after_ms,omitempty"`
 }
 
 // ----- tool.* -----

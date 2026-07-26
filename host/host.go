@@ -18,6 +18,11 @@ type Handler func(ctx context.Context, args json.RawMessage) (result json.RawMes
 type CodedError struct {
 	Code string
 	Msg  string
+	// Result, when non-nil, is an operation-specific advisory payload carried
+	// alongside the error response (e.g. llm.call's retry_after_ms hint). Most
+	// handlers leave this nil, in which case the response is identical to
+	// today's error responses.
+	Result json.RawMessage
 }
 
 func (e *CodedError) Error() string { return e.Msg }
@@ -201,10 +206,12 @@ func (h *Host) execute(ctx context.Context, req abi.Request) abi.Response {
 	if err != nil {
 		var ce *CodedError
 		code := abi.ErrInternal
+		var hint json.RawMessage
 		if asCoded(err, &ce) {
 			code = ce.Code
+			hint = ce.Result
 		}
-		return abi.Response{Error: err.Error(), Code: code}
+		return abi.Response{Error: err.Error(), Code: code, Result: hint}
 	}
 	return abi.Response{Result: result}
 }
