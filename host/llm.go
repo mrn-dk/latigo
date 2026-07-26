@@ -34,9 +34,26 @@ type LLMClient struct {
 	// attempt, no retries" — today's behaviour.
 	Retry LLMRetry
 
-	// sleep is the injectable backoff waiter, defaulting to time.Sleep. Tests
-	// override it to make retry/backoff assertions instant.
-	sleep func(time.Duration)
+	// sleep is the injectable backoff waiter, defaulting to a context-aware
+	// sleep. It returns ctx.Err() if the wait is cut short by cancellation, so
+	// a cancelled run does not sit out a long Retry-After. Tests override it to
+	// make retry/backoff assertions instant.
+	sleep func(ctx context.Context, d time.Duration) error
+}
+
+// sleepCtx waits for d or until ctx is done, whichever comes first.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // LLMRetry bounds the client's internal retry/backoff behaviour.
@@ -47,9 +64,17 @@ type LLMRetry struct {
 	// BaseDelay is the backoff base; attempt N (1-indexed) waits up to
 	// BaseDelay * 2^(N-1), jittered, before attempt N+1.
 	BaseDelay time.Duration
-	// MaxDelay caps the computed backoff (not the honoured Retry-After, which
-	// is treated as authoritative even if it exceeds MaxDelay).
+	// MaxDelay caps the computed backoff. An explicit Retry-After is honoured
+	// even when it exceeds MaxDelay — retrying earlier than the provider asked
+	// just earns another 429 — but MaxTotalWait still bounds the whole call.
 	MaxDelay time.Duration
+	// MaxTotalWait bounds the cumulative time call() will spend sleeping
+	// between attempts. When the next wait would exceed what remains, call()
+	// gives up immediately rather than blocking the hostcall, and surfaces the
+	// classified error (with the provider's Retry-After hint) instead. This is
+	// what stops a hostile or misconfigured `Retry-After: 86400` from parking a
+	// run for a day. 0 means unbounded.
+	MaxTotalWait time.Duration
 	// RetryOn decides whether a given failure is worth retrying. status is 0
 	// for transport-level failures (no HTTP response was received). The
 	// default retries 429, 5xx, and connection/timeout errors.
@@ -59,10 +84,11 @@ type LLMRetry struct {
 // defaultLLMRetry is the retry policy NewLLMClient installs.
 func defaultLLMRetry() LLMRetry {
 	return LLMRetry{
-		MaxAttempts: 5,
-		BaseDelay:   500 * time.Millisecond,
-		MaxDelay:    30 * time.Second,
-		RetryOn:     defaultRetryOn,
+		MaxAttempts:  5,
+		BaseDelay:    500 * time.Millisecond,
+		MaxDelay:     30 * time.Second,
+		MaxTotalWait: 60 * time.Second,
+		RetryOn:      defaultRetryOn,
 	}
 }
 
@@ -97,7 +123,7 @@ func NewLLMClient(baseURL, apiKey, model string) *LLMClient {
 		Model:      model,
 		HTTPClient: &http.Client{Timeout: 120 * time.Second},
 		Retry:      defaultLLMRetry(),
-		sleep:      time.Sleep,
+		sleep:      sleepCtx,
 	}
 }
 
@@ -203,7 +229,7 @@ func (c *LLMClient) call(ctx context.Context, req abi.LLMCallRequest) (abi.LLMCa
 	}
 	sleep := c.sleep
 	if sleep == nil {
-		sleep = time.Sleep
+		sleep = sleepCtx
 	}
 
 	var (
@@ -211,6 +237,7 @@ func (c *LLMClient) call(ctx context.Context, req abi.LLMCallRequest) (abi.LLMCa
 		status       int
 		retryAfterMS int
 		callErr      error
+		waited       time.Duration
 	)
 	for attempt := 1; attempt <= retry.MaxAttempts; attempt++ {
 		out, status, retryAfterMS, callErr = c.doOnce(ctx, body)
@@ -223,7 +250,18 @@ func (c *LLMClient) call(ctx context.Context, req abi.LLMCallRequest) (abi.LLMCa
 		if ctx.Err() != nil {
 			return abi.LLMCallResponse{}, ctx.Err()
 		}
-		sleep(backoffDelay(attempt, retry.BaseDelay, retry.MaxDelay, retryAfterMS))
+		delay := backoffDelay(attempt, retry.BaseDelay, retry.MaxDelay, retryAfterMS)
+		// Bound the total time this hostcall can spend asleep. A provider
+		// asking for longer than the budget allows ends the call now: the
+		// caller gets a classified error plus the retry-after hint and can
+		// decide for itself, which beats blocking the guest indefinitely.
+		if retry.MaxTotalWait > 0 && waited+delay > retry.MaxTotalWait {
+			break
+		}
+		if err := sleep(ctx, delay); err != nil {
+			return abi.LLMCallResponse{}, err
+		}
+		waited += delay
 	}
 	return abi.LLMCallResponse{}, classifyLLMError(status, retryAfterMS, callErr)
 }

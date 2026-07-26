@@ -123,10 +123,18 @@ durability boundary:
 - The reference `host.LLMClient` (`host/llm.go`) retries internally with
   bounded exponential backoff and jitter, honouring a `Retry-After` header
   when the provider sends one. This is configured via an `LLMRetry` struct
-  (`MaxAttempts`, `BaseDelay`, `MaxDelay`, `RetryOn`) on the client; a
-  zero-value `LLMRetry` means exactly one attempt (today's pre-retry
+  (`MaxAttempts`, `BaseDelay`, `MaxDelay`, `MaxTotalWait`, `RetryOn`) on the
+  client; a zero-value `LLMRetry` means exactly one attempt (today's pre-retry
   behaviour), so existing hosts that construct an `LLMClient` literal instead
   of using `NewLLMClient` are unaffected.
+- Both attempts *and total wait* are bounded. A `Retry-After` longer than the
+  client would otherwise wait is honoured rather than second-guessed, but
+  `MaxTotalWait` (60s by default) caps the cumulative sleep: if the next wait
+  would exceed the budget, the call gives up immediately and returns the
+  classified error plus the `retry_after_ms` hint, letting the caller decide.
+  This is what stops a hostile or misconfigured `Retry-After: 86400` from
+  parking a run for a day. Backoff waits are also cancellable — a cancelled
+  context cuts the wait short instead of sitting it out.
 - Because every retry happens *inside* the `llm.call` handler, a single
   hostcall still produces **exactly one** recorded event. Retries are
   invisible to the event log and to replay — this is the key determinism

@@ -20,8 +20,9 @@ func newTestLLMClient(srv *httptest.Server, retry LLMRetry) (*LLMClient, *[]time
 		Model:      "test-model",
 		HTTPClient: srv.Client(),
 		Retry:      retry,
-		sleep: func(d time.Duration) {
+		sleep: func(_ context.Context, d time.Duration) error {
 			slept = append(slept, d)
+			return nil
 		},
 	}
 	return c, &slept
@@ -231,5 +232,73 @@ func TestParseRetryAfter(t *testing.T) {
 		if got := parseRetryAfter(in); got != want {
 			t.Errorf("parseRetryAfter(%q) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+// TestRetryAfterBoundedByMaxTotalWait verifies that an absurd Retry-After does
+// not park the hostcall: the client gives up once the next wait would blow the
+// total-wait budget, and still surfaces the hint so the caller can decide.
+func TestRetryAfterBoundedByMaxTotalWait(t *testing.T) {
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Retry-After", "86400") // a day
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c, slept := newTestLLMClient(srv, LLMRetry{
+		MaxAttempts:  5,
+		BaseDelay:    10 * time.Millisecond,
+		MaxDelay:     time.Second,
+		MaxTotalWait: 60 * time.Second,
+		RetryOn:      defaultRetryOn,
+	})
+
+	_, err := c.call(context.Background(), abi.LLMCallRequest{})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (the day-long wait must not be taken)", attempts)
+	}
+	if len(*slept) != 0 {
+		t.Errorf("slept = %v, want no sleeps", *slept)
+	}
+	var ce *CodedError
+	if !asCoded(err, &ce) || ce.Code != abi.ErrRateLimited {
+		t.Errorf("code = %v, want %s", err, abi.ErrRateLimited)
+	}
+}
+
+// TestRetrySleepRespectsContextCancellation verifies a cancelled run does not
+// sit out a long backoff.
+func TestRetrySleepRespectsContextCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	c := &LLMClient{
+		BaseURL:    srv.URL,
+		Model:      "test-model",
+		HTTPClient: srv.Client(),
+		Retry: LLMRetry{
+			MaxAttempts: 5,
+			BaseDelay:   10 * time.Second,
+			MaxDelay:    10 * time.Second,
+			RetryOn:     defaultRetryOn,
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+
+	start := time.Now()
+	if _, err := c.call(ctx, abi.LLMCallRequest{}); err == nil {
+		t.Fatal("expected an error")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("call took %v; cancellation should have cut the backoff short", elapsed)
 	}
 }
