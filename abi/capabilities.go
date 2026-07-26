@@ -32,6 +32,14 @@ type Capabilities struct {
 	// Approval reports whether approval.await is available. When false, the
 	// guest treats every action as pre-approved.
 	Approval bool `json:"approval"`
+	// Steer reports whether the host has wired a real msg.recv("steer") source
+	// (see host.Messenger.In). msg.recv itself is a required op and is always
+	// present on a conformant host, but polling it every turn for nothing adds
+	// a recorded hostcall per turn; the guest's default Steer strategy point
+	// only polls when this is true, so hosts that do not wire a steering source
+	// see identical hostcall traffic and event logs to before in-loop steering
+	// existed.
+	Steer bool `json:"steer"`
 	// FSWrite reports whether the host filesystem is writable.
 	FSWrite bool `json:"fs_write"`
 	// MaxLLMTokens is an advisory cap on tokens per llm.call, 0 meaning no cap.
@@ -51,6 +59,7 @@ func Negotiate(want, have Capabilities) Capabilities {
 	eff.HTTP = want.HTTP && have.HTTP
 	eff.Checkpoint = want.Checkpoint && have.Checkpoint
 	eff.Approval = want.Approval && have.Approval
+	eff.Steer = want.Steer && have.Steer
 	eff.FSWrite = want.FSWrite && have.FSWrite
 	// Ambient is a property of the host grant, not something the guest chooses:
 	// if the host offers native execution, the run is ambient regardless of

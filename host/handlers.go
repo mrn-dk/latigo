@@ -216,8 +216,17 @@ type Messenger struct {
 	In func(channel string, blocking bool) (content string, ok bool)
 }
 
-// Messaging registers msg.send / msg.recv against m.
+// Messaging registers msg.send / msg.recv against m. msg.recv is always
+// registered (it is a required op), but supplying a non-nil In additionally
+// advertises the Steer capability (abi.Capabilities.Steer) to the guest,
+// signalling that polling msg.recv("steer") between turns is actually worth
+// the recorded hostcall — the guest's default Steer strategy point only polls
+// when this is set, so hosts that pass a nil In see no change in hostcall
+// traffic or event-log shape from in-loop steering.
 func (h *Host) Messaging(m Messenger) {
+	if m.In != nil {
+		h.caps.Steer = true
+	}
 	h.Handle(abi.OpMsgSend, handler(func(_ context.Context, r abi.MsgSendRequest) (abi.MsgSendResponse, error) {
 		if m.Out != nil {
 			m.Out(r.Channel, r.Content)
