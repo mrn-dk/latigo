@@ -55,7 +55,8 @@ when an optional capability is absent (e.g. no `approval` capability means every
 action is treated as pre-approved).
 
 Required operations are always present on a conformant host. Optional
-capabilities are `http`, `checkpoint`, `exec`, `approval`, and `fs_write`.
+capabilities are `http`, `checkpoint`, `exec`, `approval`, `steer`, and
+`fs_write`.
 
 ### Trust tiers and the single-egress rule
 
@@ -156,6 +157,56 @@ durability boundary:
 - Guest-side wall-clock backoff is deliberately **not** supported: sleeping
   driven by the guest would be non-deterministic and break replay. Backoff
   lives entirely in the host handler; the guest only ever sees the outcome.
+
+### In-loop steering and approval gating
+
+`approval.await` and `msg.recv` are ordinary governed hostcalls (see above),
+but the reference guest agent loop (`guest/agent.go`) also gives them a
+default *policy*, so a host that wires them gets human/host-in-the-loop
+control for free, without the host having to understand the agent's internal
+turn structure.
+
+**Approval gating.** Before invoking a tool, the agent consults an overridable
+`ApprovalGate` strategy point. This is consulted only when the host grants the
+`approval` capability; the default gate requires approval for the
+ambient/dangerous surface — `exec.run`-backed tools, `http_fetch`, VFS writes
+that escape `/work`, and fs-removal tools — everything else (bash inside the
+sandboxed VFS, reads, in-`/work` writes, skills, scripts) runs unattended. A
+denial is **not** fatal: it is fed back to the model as the tool's result
+(`"denied by host: <reason>"`) and the run continues, giving the model a
+chance to try something else. Because `Client.ApprovalAwait` already degrades
+to "approved" when the `approval` capability is absent, hosts that never call
+`(*host.Host).Approval` are completely unaffected — no extra hostcall, no
+change in behaviour.
+
+**Steering.** At the top of each turn the agent consults an overridable
+`Steer` strategy point, which by default performs a non-blocking
+`msg.recv("steer", false)`. A pending message is appended as a `user` message
+so the model sees it on its next `llm.call`; the sentinel `"/stop"` instead
+ends the run gracefully before that turn's `llm.call`. This is gated behind a
+new `steer` capability (`abi.Capabilities.Steer`) rather than being
+unconditional: polling `msg.recv` every turn is harmless (it's just another
+recorded hostcall that replays verbatim) but it does add one hostcall per turn
+to the event log, so hosts that never wire a real steering source should see
+*zero* change to their hostcall traffic or log shape. `(*host.Host).Messaging`
+sets this capability automatically when given a non-nil `Messenger.In`. Hosts
+that do wire steering but want fewer hostcalls can additionally raise the
+guest's `Agent.SteerEvery` to poll every Nth turn instead of every turn.
+
+Both mechanisms need no new replay machinery: `approval.await` and `msg.recv`
+are recorded write-ahead like any other hostcall, so a denial or an injected
+steering message reconstructs exactly on replay — the human/host input becomes
+part of the durable record. One consequence worth calling out for host
+authors: a replay host **must** advertise the same `Capabilities` the original
+run negotiated (in particular `approval` and `steer`), or the guest will
+skip/add hostcalls relative to what the log expects next and replay will
+diverge with a "replay divergence" error. The reference CLI's `-replay` path
+(`cmd/latigo-local/main.go`) does this by propagating the full `Capabilities`
+struct recorded in the `run_start` event.
+
+See `cmd/latigo-local/main.go`'s `-approve` (interactive y/n prompts) and
+`-steer` (stdin lines injected as steering messages, `/stop` to end the run)
+flags for a working reference wiring.
 
 ## Conformance
 
