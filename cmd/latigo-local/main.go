@@ -34,6 +34,7 @@ func main() {
 		allowHTTP  = flag.Bool("http", false, "enable the governed http.fetch capability")
 		httpAllow  = flag.String("http-allow", "", "comma-separated host globs for http.fetch (empty denies all)")
 		approve    = flag.Bool("approve", false, "require interactive approval for actions")
+		steer      = flag.Bool("steer", false, "read stdin lines as in-loop steering messages injected into the running agent (\"/stop\" ends the run gracefully); do not combine with -approve, both read stdin")
 		replay     = flag.Bool("replay", false, "replay a run from the event log instead of executing")
 		checkpoint = flag.Bool("checkpoint", true, "enable state.checkpoint/state.restore (durable snapshots)")
 		compact    = flag.Bool("compact", false, "compact the event log to the last checkpoint, then exit")
@@ -51,7 +52,7 @@ func main() {
 		wasmPath: *wasmPath, logPath: *logPath, root: *root, model: *model,
 		baseURL: *baseURL, apiKey: *apiKey, goal: goal, maxTurns: *maxTurns,
 		execAllow: *allowExec, execNet: *execNet, allowHTTP: *allowHTTP, httpAllow: *httpAllow,
-		approve: *approve, replay: *replay, checkpoint: *checkpoint, compact: *compact,
+		approve: *approve, steer: *steer, replay: *replay, checkpoint: *checkpoint, compact: *compact,
 		subagents: *subagents, maxDepth: *maxDepth, compaction: *compaction,
 	}
 	if err := run(cfg); err != nil {
@@ -68,7 +69,7 @@ type runOptions struct {
 	execAllow, httpAllow           string
 	compaction                     string
 	execNet, allowHTTP             bool
-	approve, replay                bool
+	approve, steer, replay         bool
 	checkpoint, compact, subagents bool
 }
 
@@ -121,6 +122,13 @@ func configureHost(h *host.Host, wasm []byte, o runOptions, depth int, resultOut
 	} else {
 		h.Log(discardWriter{})
 	}
+	// Steering messages: only wired at the top level (subagents run headless,
+	// with no interactive input of their own), and only when requested, since
+	// it starts a goroutine that consumes stdin.
+	var msgIn func(channel string, blocking bool) (string, bool)
+	if o.steer && depth == 0 {
+		msgIn = stdinSteerSource()
+	}
 	h.Messaging(host.Messenger{
 		Out: func(channel, content string) {
 			if depth == 0 {
@@ -130,6 +138,7 @@ func configureHost(h *host.Host, wasm []byte, o runOptions, depth int, resultOut
 				*resultOut = content
 			}
 		},
+		In: msgIn,
 	})
 
 	if o.checkpoint {
@@ -259,8 +268,11 @@ func doReplay(ctx context.Context, wasm []byte, logPath, root, model, goal strin
 	}
 	// In replay we still need a run config; the goal and the capabilities the
 	// guest ran with come from run_start. The capabilities matter: the guest
-	// only issues state.restore/state.checkpoint when it ran with Checkpoint, so
-	// the replay host must advertise the same set to reproduce the hostcalls.
+	// only issues state.restore/state.checkpoint when it ran with Checkpoint,
+	// only consults ApprovalGate when it ran with Approval, and only polls
+	// msg.recv for steering when it ran with Steer — so the replay host must
+	// advertise the *entire* recorded capability set, or the guest will skip
+	// (or add) hostcalls and the replay will diverge from the log.
 	caps := abi.Capabilities{FSWrite: true}
 	for _, ev := range evs {
 		if ev.Kind == events.KindRunStart {
@@ -269,7 +281,7 @@ func doReplay(ctx context.Context, wasm []byte, logPath, root, model, goal strin
 			if rs.Goal != "" {
 				goal = rs.Goal
 			}
-			caps.Checkpoint = rs.Capabilities.Checkpoint
+			caps = rs.Capabilities
 		}
 	}
 	h := host.New(caps, nil)
@@ -282,6 +294,40 @@ func doReplay(ctx context.Context, wasm []byte, logPath, root, model, goal strin
 		Wasm: wasm, Goal: goal, Model: model, MaxTurns: maxTurns,
 		Stdout: prefixWriter("replay> "), Stderr: prefixWriter("replay! "),
 	})
+}
+
+// stdinSteerSource starts a background goroutine that reads newline-delimited
+// messages from stdin into a buffered queue, and returns a host.Messenger.In
+// implementation that serves them on the "steer" channel (any other channel
+// reports no message). Lines are consumed exactly once, oldest first; the
+// agent's default Steer strategy point treats a bare "/stop" line as a
+// request to end the run gracefully. Do not combine with -approve: the
+// interactive approval prompt also reads stdin synchronously, and the two
+// would race for lines.
+func stdinSteerSource() func(channel string, blocking bool) (string, bool) {
+	lines := make(chan string, 32)
+	go func() {
+		sc := bufio.NewScanner(os.Stdin)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+		close(lines)
+	}()
+	return func(channel string, blocking bool) (string, bool) {
+		if channel != "steer" {
+			return "", false
+		}
+		if blocking {
+			line, ok := <-lines
+			return line, ok
+		}
+		select {
+		case line, ok := <-lines:
+			return line, ok
+		default:
+			return "", false
+		}
+	}
 }
 
 func interactiveApproval(action string, details json.RawMessage) (bool, string) {
