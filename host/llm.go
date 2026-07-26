@@ -3,6 +3,7 @@ package host
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -154,6 +155,10 @@ type oaiToolCall struct {
 	} `json:"function"`
 }
 
+// oaiMessage is a message as returned in an OpenAI chat/completions response.
+// Response content is always a plain string in the dialect this client
+// speaks (vision models don't echo image parts back in the assistant turn),
+// so this stays untouched by multimodal support.
 type oaiMessage struct {
 	Role       string        `json:"role"`
 	Content    string        `json:"content"`
@@ -162,12 +167,40 @@ type oaiMessage struct {
 	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
 }
 
+// oaiImageURL is the "image_url" object of an OpenAI image content part. Both
+// an https(s) URL and a data: URI (inline base64) are valid values of URL.
+type oaiImageURL struct {
+	URL string `json:"url"`
+}
+
+// oaiContentPart is one element of an OpenAI chat message's "content" array
+// dialect: {"type":"text","text":...} or
+// {"type":"image_url","image_url":{"url":...}}.
+type oaiContentPart struct {
+	Type     string       `json:"type"`
+	Text     string       `json:"text,omitempty"`
+	ImageURL *oaiImageURL `json:"image_url,omitempty"`
+}
+
+// oaiReqMessage is a message as sent in an OpenAI chat/completions request.
+// Content holds either a plain string (the common, backward-compatible case
+// — no structured Parts) or an []oaiContentPart (built by oaiContent below)
+// when the source abi.LLMMessage carries multimodal Parts; encoding/json
+// marshals either shape correctly through the `any` field.
+type oaiReqMessage struct {
+	Role       string        `json:"role"`
+	Content    any           `json:"content"`
+	Name       string        `json:"name,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
+}
+
 type oaiRequest struct {
-	Model       string       `json:"model"`
-	Messages    []oaiMessage `json:"messages"`
-	Tools       []oaiTool    `json:"tools,omitempty"`
-	Temperature float64      `json:"temperature,omitempty"`
-	MaxTokens   int          `json:"max_tokens,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []oaiReqMessage `json:"messages"`
+	Tools       []oaiTool       `json:"tools,omitempty"`
+	Temperature float64         `json:"temperature,omitempty"`
+	MaxTokens   int             `json:"max_tokens,omitempty"`
 }
 
 type oaiResponse struct {
@@ -182,6 +215,61 @@ type oaiResponse struct {
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// oaiContent translates an abi.LLMMessage's Content/Parts into the value that
+// belongs in an OpenAI chat message's "content" field. This is the only place
+// that knows the OpenAI wire dialect for content; per spec 01, Parts (when
+// non-empty) is authoritative and Content is not also emitted alongside it.
+//
+// This function, and oaiContentParts below it, are structured so a second
+// wire dialect (Anthropic's messages API, which also represents content as an
+// array of typed parts — {"type":"text",...} / {"type":"image",...} with a
+// "source" object rather than OpenAI's "image_url") is a table test away: the
+// dialect-neutral input is already abi.ContentPart, so an Anthropic client
+// would add its own anthropicContentParts(parts []abi.ContentPart)
+// []anthropicContentPart sibling and share this same call site shape. No
+// Anthropic client exists in this repo yet (see the spec's "gap" note) — this
+// is deliberately just leaving room for one.
+func oaiContent(m abi.LLMMessage) any {
+	if len(m.Parts) == 0 {
+		return m.Content
+	}
+	return oaiContentParts(m.Parts)
+}
+
+// oaiContentParts maps ABI content parts onto OpenAI's content-array dialect.
+// Unknown part types degrade to plain text (best-effort forward
+// compatibility with future abi.ContentPart.Type values per spec 01's
+// non-goals, e.g. audio/video); an image part with neither inline Data nor a
+// URL is dropped since there is nothing to send.
+func oaiContentParts(parts []abi.ContentPart) []oaiContentPart {
+	out := make([]oaiContentPart, 0, len(parts))
+	for _, p := range parts {
+		if p.Type == "image" {
+			if p.Image == nil {
+				continue
+			}
+			url := p.Image.URL
+			if url == "" && len(p.Image.Data) > 0 {
+				mt := p.Image.MediaType
+				if mt == "" {
+					mt = "application/octet-stream"
+				}
+				url = "data:" + mt + ";base64," + base64.StdEncoding.EncodeToString(p.Image.Data)
+			}
+			if url == "" {
+				continue
+			}
+			out = append(out, oaiContentPart{Type: "image_url", ImageURL: &oaiImageURL{URL: url}})
+			continue
+		}
+		// "text" and anything unrecognized: pass Text through as a text part.
+		if p.Text != "" {
+			out = append(out, oaiContentPart{Type: "text", Text: p.Text})
+		}
+	}
+	return out
 }
 
 // call is the llm.call handler. It retries internally (bounded exponential
@@ -199,7 +287,7 @@ func (c *LLMClient) call(ctx context.Context, req abi.LLMCallRequest) (abi.LLMCa
 		MaxTokens:   req.MaxTokens,
 	}
 	for _, m := range req.Messages {
-		om := oaiMessage{Role: m.Role, Content: m.Content, Name: m.Name, ToolCallID: m.ToolCallID}
+		om := oaiReqMessage{Role: m.Role, Content: oaiContent(m), Name: m.Name, ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {
 			oc := oaiToolCall{ID: tc.ID, Type: "function"}
 			oc.Function.Name = tc.Name

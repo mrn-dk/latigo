@@ -1,9 +1,11 @@
 package guest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"path"
 	"strings"
 
 	"github.com/mrn-dk/latigo/abi"
@@ -135,6 +137,38 @@ func (a *Agent) registerBuiltins() {
 		},
 	})
 
+	r.Add(Tool{
+		Name:        "attach_image",
+		Description: "Read an image file from the virtual filesystem and attach it to the tool result as an image the model can see. Degrades to a text note when the host does not support image content.",
+		Schema:      json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}`),
+		InvokeRich: func(ctx context.Context, args json.RawMessage) (RichResult, error) {
+			var in struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(args, &in); err != nil {
+				return RichResult{}, err
+			}
+			data, err := a.vfs.ReadFile(in.Path)
+			if err != nil {
+				return RichResult{}, err
+			}
+			// Refuse oversized attachments: this image would ride in every
+			// later llm.call request, each recorded verbatim in the log.
+			if max := a.maxAttachBytes(); len(data) > max {
+				return RichResult{}, fmt.Errorf(
+					"image %s is %d bytes, over the %d-byte attachment cap; resize it before attaching",
+					in.Path, len(data), max)
+			}
+			mt := sniffImageMediaType(in.Path, data)
+			return RichResult{
+				Text: fmt.Sprintf("attached image %s (%d bytes, %s)", in.Path, len(data), mt),
+				Parts: []abi.ContentPart{
+					{Type: "image", Image: &abi.ImageData{MediaType: mt, Data: data}},
+				},
+			}, nil
+		},
+	})
+
 	if a.cfg.Capabilities.HTTP {
 		r.Add(Tool{
 			Name:        "http_fetch",
@@ -190,4 +224,34 @@ func (a *Agent) registerBuiltins() {
 			return "acknowledged", nil
 		},
 	})
+}
+
+// sniffImageMediaType infers an image's media type, first from p's extension
+// and falling back to a magic-byte sniff of data. Client-side resizing/OCR is
+// explicitly out of scope for the guest (that's the host's job); this is just
+// enough to tag bytes with a reasonable Content-Type-like label for the
+// image content part.
+func sniffImageMediaType(p string, data []byte) string {
+	switch strings.ToLower(path.Ext(p)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	}
+	switch {
+	case bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")):
+		return "image/png"
+	case bytes.HasPrefix(data, []byte{0xFF, 0xD8, 0xFF}):
+		return "image/jpeg"
+	case bytes.HasPrefix(data, []byte("GIF87a")), bytes.HasPrefix(data, []byte("GIF89a")):
+		return "image/gif"
+	case bytes.HasPrefix(data, []byte("RIFF")) && len(data) > 12 && string(data[8:12]) == "WEBP":
+		return "image/webp"
+	default:
+		return "application/octet-stream"
+	}
 }

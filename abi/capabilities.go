@@ -42,6 +42,14 @@ type Capabilities struct {
 	Steer bool `json:"steer"`
 	// FSWrite reports whether the host filesystem is writable.
 	FSWrite bool `json:"fs_write"`
+	// Multimodal reports whether llm.call accepts image content parts
+	// (abi.ContentPart{Type:"image"}) in message Parts. The host should only
+	// advertise this when the configured model actually accepts images. The
+	// guest must not emit image parts when this is false; it degrades by
+	// dropping images and inserting a text placeholder instead (see
+	// guest.Registry.Invoke and the initial-turn image handling in
+	// guest/agent.go), so a text-only host still works unmodified.
+	Multimodal bool `json:"multimodal"`
 	// MaxLLMTokens is an advisory cap on tokens per llm.call, 0 meaning no cap.
 	MaxLLMTokens int `json:"max_llm_tokens"`
 	// HostVersion identifies the host implementation for diagnostics.
@@ -61,6 +69,7 @@ func Negotiate(want, have Capabilities) Capabilities {
 	eff.Approval = want.Approval && have.Approval
 	eff.Steer = want.Steer && have.Steer
 	eff.FSWrite = want.FSWrite && have.FSWrite
+	eff.Multimodal = want.Multimodal && have.Multimodal
 	// Ambient is a property of the host grant, not something the guest chooses:
 	// if the host offers native execution, the run is ambient regardless of
 	// what the guest wanted.

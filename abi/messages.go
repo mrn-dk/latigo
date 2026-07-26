@@ -65,10 +65,40 @@ type FSMkdirResponse struct{}
 
 // ----- llm.call -----
 
+// ContentPart is one element of a message's structured content: either a text
+// span or an image. It is the ABI's provider-agnostic content model — both
+// OpenAI and Anthropic represent a message's content as an array of typed
+// parts like this, so a host translator (see host/llm.go) maps it onto
+// whichever wire dialect it speaks. The Type enum is intentionally open (see
+// spec 01's non-goals: audio/video are plausible future values).
+type ContentPart struct {
+	Type  string     `json:"type"`            // "text" | "image"
+	Text  string     `json:"text,omitempty"`  // when Type=="text"
+	Image *ImageData `json:"image,omitempty"` // when Type=="image"
+}
+
+// ImageData is the payload of an image content part: either inline bytes or a
+// URL, tagged with a media type. Data is base64-encoded by encoding/json since
+// the field is []byte.
+type ImageData struct {
+	MediaType string `json:"media_type"`     // e.g. "image/png", "image/jpeg"
+	Data      []byte `json:"data,omitempty"` // base64 via encoding/json
+	URL       string `json:"url,omitempty"`  // alternative to inline data
+}
+
 // LLMMessage is one chat message in an OpenAI-compatible exchange.
+//
+// Content is the plain-text shorthand and is always populated for text-only
+// messages (the common case, and the only case a text-only host or guest ever
+// needs). Parts is the optional, structured multimodal form: when non-empty it
+// is authoritative and takes precedence over Content for the purposes of what
+// gets sent to the model (a host translator ignores Content once Parts is
+// set). Parts is omitempty so old event logs and text-only hosts are
+// completely unaffected by its addition.
 type LLMMessage struct {
 	Role       string        `json:"role"`
 	Content    string        `json:"content"`
+	Parts      []ContentPart `json:"parts,omitempty"`
 	Name       string        `json:"name,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
 	ToolCalls  []LLMToolCall `json:"tool_calls,omitempty"`
@@ -134,8 +164,12 @@ type ToolInvokeRequest struct {
 }
 
 type ToolInvokeResponse struct {
-	Result  RawJSON `json:"result"`
-	IsError bool    `json:"is_error"`
+	Result RawJSON `json:"result"`
+	// Parts carries structured content (e.g. images) a tool wants to attach to
+	// its result message, alongside/instead of the plain-text Result. Empty for
+	// every existing tool; omitempty keeps old logs unaffected.
+	Parts   []ContentPart `json:"parts,omitempty"`
+	IsError bool          `json:"is_error"`
 }
 
 // ----- exec.run (optional) -----

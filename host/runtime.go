@@ -35,6 +35,13 @@ type RunConfig struct {
 	// Compaction selects the guest's transcript compaction strategy
 	// ("window" or "llm"); empty uses the guest default.
 	Compaction string
+	// Images are host-attached images (e.g. latigo-local's -image flag)
+	// delivered to the guest's initial user turn alongside Goal. The guest
+	// degrades them to a text placeholder when it was not negotiated the
+	// Multimodal capability. Callers should already have applied a size cap
+	// (see CapImage) — these bytes are resent in full on every subsequent
+	// llm.call request for the rest of the run.
+	Images []abi.ImageData
 	// Stdout/Stderr capture the guest's process output.
 	Stdout io.Writer
 	Stderr io.Writer
@@ -99,6 +106,10 @@ func (h *Host) Run(ctx context.Context, cfg RunConfig) error {
 		WithEnv("LATIGO_CAPABILITIES", string(capsJSON)).
 		WithEnv("LATIGO_MAX_TURNS", itoa(cfg.MaxTurns)).
 		WithEnv("LATIGO_COMPACTION", cfg.Compaction)
+	if len(cfg.Images) > 0 {
+		imagesJSON, _ := json.Marshal(cfg.Images)
+		modCfg = modCfg.WithEnv("LATIGO_GOAL_IMAGES", string(imagesJSON))
+	}
 
 	// run_start is the first durable event (records negotiated capabilities).
 	if h.log != nil && !h.replaying {
