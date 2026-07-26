@@ -152,6 +152,13 @@ func (a *Agent) registerBuiltins() {
 			if err != nil {
 				return RichResult{}, err
 			}
+			// Refuse oversized attachments: this image would ride in every
+			// later llm.call request, each recorded verbatim in the log.
+			if max := a.maxAttachBytes(); len(data) > max {
+				return RichResult{}, fmt.Errorf(
+					"image %s is %d bytes, over the %d-byte attachment cap; resize it before attaching",
+					in.Path, len(data), max)
+			}
 			mt := sniffImageMediaType(in.Path, data)
 			return RichResult{
 				Text: fmt.Sprintf("attached image %s (%d bytes, %s)", in.Path, len(data), mt),

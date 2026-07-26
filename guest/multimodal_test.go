@@ -3,6 +3,7 @@ package guest
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/mrn-dk/latigo/abi"
@@ -236,5 +237,45 @@ func TestInitialUserMessageNoImagesUnchanged(t *testing.T) {
 	msg := agent.initialUserMessage()
 	if msg.Content != "plain goal" || len(msg.Parts) != 0 {
 		t.Errorf("initialUserMessage() = %+v, want plain Content-only message", msg)
+	}
+}
+
+// TestAttachImageRefusesOversized covers the guest-side attachment cap. Unlike
+// host-attached images (capped by the host before the guest sees them), this
+// path is model-driven, and an oversized attachment would be re-sent — and
+// re-recorded — on every subsequent turn.
+func TestAttachImageRefusesOversized(t *testing.T) {
+	client := NewClient(&fakeTransport{})
+	agent := NewAgent(Config{
+		Goal:           "g",
+		MaxTurns:       4,
+		MaxAttachBytes: 64,
+		Capabilities:   abi.Capabilities{Multimodal: true},
+	}, client)
+
+	big := make([]byte, 65)
+	if err := agent.vfs.WriteFile("/work/big.png", big); err != nil {
+		t.Fatal(err)
+	}
+	small := []byte("\x89PNG\r\n\x1a\n small")
+	if err := agent.vfs.WriteFile("/work/ok.png", small); err != nil {
+		t.Fatal(err)
+	}
+
+	args, _ := json.Marshal(map[string]string{"path": "/work/big.png"})
+	out, parts, isErr := agent.tools.Invoke(context.Background(), "attach_image", args)
+	if !isErr {
+		t.Errorf("oversized attach: isErr = false, want true (out=%q)", out)
+	}
+	if len(parts) != 0 {
+		t.Errorf("oversized attach returned %d parts, want 0", len(parts))
+	}
+	if !strings.Contains(out, "attachment cap") {
+		t.Errorf("error = %q, want it to mention the cap", out)
+	}
+
+	args, _ = json.Marshal(map[string]string{"path": "/work/ok.png"})
+	if _, parts, isErr := agent.tools.Invoke(context.Background(), "attach_image", args); isErr || len(parts) != 1 {
+		t.Errorf("under-cap attach: isErr=%v parts=%d, want false/1", isErr, len(parts))
 	}
 }

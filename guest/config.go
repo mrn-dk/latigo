@@ -24,7 +24,20 @@ type Config struct {
 	// include in the initial user turn alongside Goal. Degraded to a text
 	// placeholder per Capabilities.Multimodal — see Agent.initialUserMessage.
 	Images []abi.ImageData
+	// MaxAttachBytes caps a single image the *guest* pulls into the transcript
+	// (attach_image reading from the VFS). Unlike host-attached images, which
+	// the host caps before they ever reach the guest, this path is driven by
+	// the model: the whole transcript is resent on every llm.call and each
+	// request is recorded verbatim, so one oversized attach inflates the log on
+	// every subsequent turn. Attaching above the cap fails with a text error
+	// rather than silently truncating. 0 uses DefaultMaxAttachBytes.
+	MaxAttachBytes int
 }
+
+// DefaultMaxAttachBytes bounds a single guest-initiated image attachment. It
+// mirrors host.DefaultMaxImageBytes; the guest cannot re-encode (that is the
+// host's job), so it refuses rather than downscales.
+const DefaultMaxAttachBytes = 2 << 20 // 2 MiB
 
 // Environment variable / arg names understood by the guest.
 const (
@@ -63,4 +76,12 @@ func LoadConfig() Config {
 		cfg.Goal = args[1]
 	}
 	return cfg
+}
+
+// maxAttachBytes returns the effective per-image attachment cap.
+func (a *Agent) maxAttachBytes() int {
+	if a.cfg.MaxAttachBytes > 0 {
+		return a.cfg.MaxAttachBytes
+	}
+	return DefaultMaxAttachBytes
 }
