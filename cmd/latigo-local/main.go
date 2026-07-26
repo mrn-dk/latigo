@@ -41,7 +41,10 @@ func main() {
 		subagents  = flag.Bool("subagents", false, "expose a host-orchestrated 'delegate' subagent tool")
 		maxDepth   = flag.Int("max-depth", 2, "maximum subagent nesting depth")
 		compaction = flag.String("compaction", "window", "transcript compaction strategy: window|llm")
+		multimodal = flag.Bool("multimodal", false, "advertise the multimodal capability (the configured model must actually accept images)")
 	)
+	var imagePaths stringList
+	flag.Var(&imagePaths, "image", "path to an image file to attach to the initial goal (repeatable)")
 	flag.Parse()
 	goal := strings.Join(flag.Args(), " ")
 	if goal == "" && !*replay && !*compact {
@@ -54,6 +57,7 @@ func main() {
 		execAllow: *allowExec, execNet: *execNet, allowHTTP: *allowHTTP, httpAllow: *httpAllow,
 		approve: *approve, steer: *steer, replay: *replay, checkpoint: *checkpoint, compact: *compact,
 		subagents: *subagents, maxDepth: *maxDepth, compaction: *compaction,
+		multimodal: *multimodal, imagePaths: []string(imagePaths),
 	}
 	if err := run(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "latigo-local:", err)
@@ -71,6 +75,24 @@ type runOptions struct {
 	execNet, allowHTTP             bool
 	approve, steer, replay         bool
 	checkpoint, compact, subagents bool
+	multimodal                     bool
+	imagePaths                     []string
+}
+
+// stringList is a repeatable flag.Value (flag.Var target) that appends each
+// -image occurrence rather than overwriting it.
+type stringList []string
+
+func (s *stringList) String() string {
+	if s == nil {
+		return ""
+	}
+	return strings.Join(*s, ",")
+}
+
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
 }
 
 func run(o runOptions) error {
@@ -93,17 +115,23 @@ func run(o runOptions) error {
 		return nil
 	}
 
+	images, err := loadImages(o.imagePaths)
+	if err != nil {
+		return err
+	}
+
 	log, err := host.OpenEventLog(o.logPath, "latigo-local/0.0.0")
 	if err != nil {
 		return err
 	}
 	defer log.Close()
 
-	h := host.New(abi.Capabilities{FSWrite: true, HostVersion: "latigo-local/0.0.0"}, log)
+	h := host.New(abi.Capabilities{FSWrite: true, Multimodal: o.multimodal, HostVersion: "latigo-local/0.0.0"}, log)
 	configureHost(h, wasm, o, 0, nil)
 
 	return h.Run(ctx, host.RunConfig{
 		Wasm: wasm, Goal: o.goal, Model: o.model, MaxTurns: o.maxTurns, Compaction: o.compaction,
+		Images: images,
 		Stdout: prefixWriter("guest> "), Stderr: prefixWriter("guest! "),
 	})
 }
