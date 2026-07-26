@@ -348,6 +348,58 @@ func TestApprovalGateWriteOutsideWork(t *testing.T) {
 	}
 }
 
+// TestApprovalGateEditToolsMatchWriteFile verifies edit_file and multi_edit
+// are gated identically to write_file: same /work-escape check on the same
+// "path" field, for both the in-sandbox (unattended) and escaping (gated)
+// cases.
+func TestApprovalGateEditToolsMatchWriteFile(t *testing.T) {
+	editInside, _ := json.Marshal(map[string]any{"path": "/work/a.txt", "old": "x", "new": "y"})
+	editOutside, _ := json.Marshal(map[string]any{"path": "/etc/passwd", "old": "x", "new": "y"})
+	multiInside, _ := json.Marshal(map[string]any{"path": "/work/a.txt", "edits": []map[string]string{{"old": "x", "new": "y"}}})
+	multiOutside, _ := json.Marshal(map[string]any{"path": "/etc/passwd", "edits": []map[string]string{{"old": "x", "new": "y"}}})
+
+	for _, tc := range []struct {
+		name string
+		args json.RawMessage
+		tool string
+		want bool
+	}{
+		{"edit_file under /work", editInside, "edit_file", false},
+		{"edit_file outside /work", editOutside, "edit_file", true},
+		{"multi_edit under /work", multiInside, "multi_edit", false},
+		{"multi_edit outside /work", multiOutside, "multi_edit", true},
+	} {
+		if _, _, need := defaultApprovalGate(nil, tc.tool, tc.args); need != tc.want {
+			t.Errorf("%s: need=%v, want %v", tc.name, need, tc.want)
+		}
+	}
+}
+
+// TestApprovalGateEditEscapingWorkIsGatedLive runs the escaping edit_file
+// path through the full agent loop (not just the gate function in
+// isolation), confirming an edit targeting outside /work actually pauses for
+// approval.await like write_file does, end to end.
+func TestApprovalGateEditEscapingWorkIsGatedLive(t *testing.T) {
+	editArgs, _ := json.Marshal(map[string]any{"path": "/etc/passwd", "old": "", "new": "pwned"})
+	doneArgs, _ := json.Marshal(map[string]string{"summary": "ok"})
+	ft := &fakeTransport{
+		approveAll: true,
+		llmTurns: []abi.LLMMessage{
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "1", Name: "edit_file", Arguments: string(editArgs)}}},
+			{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "2", Name: "done", Arguments: string(doneArgs)}}},
+		},
+	}
+	client := NewClient(ft)
+	agent := NewAgent(Config{Goal: "g", MaxTurns: 8, Capabilities: abi.Capabilities{Approval: true}}, client)
+
+	if _, err := agent.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(ft.approvalCalls) != 1 || ft.approvalCalls[0].Action != "edit_file" {
+		t.Fatalf("approval calls = %+v, want exactly one for edit_file", ft.approvalCalls)
+	}
+}
+
 // ----- steering -----
 
 func TestSteerInjectsMessageAtNextTurn(t *testing.T) {
@@ -458,5 +510,90 @@ func TestSteerEveryThrottle(t *testing.T) {
 	}
 	if ft.msgRecvCalls != 2 {
 		t.Fatalf("msg.recv calls = %d, want 2 (turns 0 and 2 of 3)", ft.msgRecvCalls)
+	}
+}
+
+// ----- edit_file / multi_edit / plan: replay determinism -----
+
+// scriptedEditPlanTurns builds a fixed sequence of tool calls exercising
+// edit_file, multi_edit, and plan together, followed by "done". Both are pure
+// in-guest computation over the VFS and agent state with no hostcalls (spec
+// 06), so running the identical script twice must reproduce byte-identical
+// VFS contents and message transcripts — that is the replay guarantee this
+// test stands in for (no new event kind is introduced, so there is nothing
+// for a host-level event log replay to diverge on; determinism reduces to
+// "same inputs, same outputs" at the guest level, which this checks directly).
+func scriptedEditPlanTurns() []abi.LLMMessage {
+	createArgs, _ := json.Marshal(map[string]any{"path": "/work/app.go", "old": "", "new": "func handler() {}\n"})
+	multiArgs, _ := json.Marshal(map[string]any{
+		"path": "/work/app.go",
+		"edits": []map[string]string{
+			{"old": "func handler() {}\n", "new": "func handler(ctx context.Context) {\n\treturn\n}\n"},
+		},
+	})
+	planArgs, _ := json.Marshal(map[string]any{
+		"op": "set",
+		"items": []map[string]any{
+			{"id": 1, "text": "add ctx param", "status": "done"},
+			{"id": 2, "text": "run tests", "status": "pending"},
+		},
+	})
+	doneArgs, _ := json.Marshal(map[string]string{"summary": "refactored handler"})
+	return []abi.LLMMessage{
+		{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "1", Name: "edit_file", Arguments: string(createArgs)}}},
+		{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "2", Name: "multi_edit", Arguments: string(multiArgs)}}},
+		{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "3", Name: "plan", Arguments: string(planArgs)}}},
+		{Role: "assistant", ToolCalls: []abi.LLMToolCall{{ID: "4", Name: "done", Arguments: string(doneArgs)}}},
+	}
+}
+
+func runScriptedEditPlanAgent(t *testing.T) *Agent {
+	t.Helper()
+	ft := &fakeTransport{llmTurns: scriptedEditPlanTurns()}
+	agent := NewAgent(Config{Goal: "refactor", MaxTurns: 8}, NewClient(ft))
+	if _, err := agent.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return agent
+}
+
+func TestReplayEditAndPlanReproducesIdenticalVFSAndTranscript(t *testing.T) {
+	first := runScriptedEditPlanAgent(t)
+	second := runScriptedEditPlanAgent(t)
+
+	firstFiles := first.VFS().SnapshotFull()
+	secondFiles := second.VFS().SnapshotFull()
+	if len(firstFiles) != len(secondFiles) {
+		t.Fatalf("file counts differ: %d vs %d", len(firstFiles), len(secondFiles))
+	}
+	for p, data := range firstFiles {
+		if string(secondFiles[p]) != string(data) {
+			t.Errorf("VFS %s diverged:\nfirst:  %q\nsecond: %q", p, data, secondFiles[p])
+		}
+	}
+
+	firstJSON, _ := json.Marshal(first.messages)
+	secondJSON, _ := json.Marshal(second.messages)
+	if string(firstJSON) != string(secondJSON) {
+		t.Errorf("transcripts diverged:\nfirst:  %s\nsecond: %s", firstJSON, secondJSON)
+	}
+
+	if len(first.plan) != len(second.plan) {
+		t.Fatalf("plan lengths differ: %d vs %d", len(first.plan), len(second.plan))
+	}
+	for i := range first.plan {
+		if first.plan[i] != second.plan[i] {
+			t.Errorf("plan item %d diverged: %+v vs %+v", i, first.plan[i], second.plan[i])
+		}
+	}
+
+	// Sanity: the run actually exercised the edit/plan path, so the assertions
+	// above are meaningful and not vacuously true.
+	want := "func handler(ctx context.Context) {\n\treturn\n}\n"
+	if got := string(firstFiles["/work/app.go"]); got != want {
+		t.Fatalf("app.go = %q, want %q", got, want)
+	}
+	if len(first.plan) != 2 || first.plan[0].Status != PlanDone {
+		t.Fatalf("plan = %+v, want the scripted two-item plan", first.plan)
 	}
 }
