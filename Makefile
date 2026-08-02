@@ -1,37 +1,30 @@
-GUEST_WASM ?= latigo.wasm
+GOMOD ?= github.com/mrn-dk/latigo
+WASM ?= latigo.wasm
+BIN ?= latigo
 GOAL ?= Explore the workspace and report what you find.
 
-.PHONY: all guest host bench test conformance run replay clean fmt vet
+.PHONY: all build wasm run test fmt vet clean
 
-all: guest host
+all: build
 
-## guest: build the harness to WebAssembly (wasip1)
-guest:
-	GOOS=wasip1 GOARCH=wasm go build -o $(GUEST_WASM) ./cmd/latigo-guest
+## build: compile the native binary (the single-host dev / test path)
+build:
+	go build -o $(BIN) .
 
-## host: build the reference local host CLI
-host:
-	go build -o latigo-local ./cmd/latigo-local
+## wasm: compile to WebAssembly (WASI Preview 1; runs under a WASIX runtime).
+## NOTE: this compiles cleanly today, but Go's wasip1 net/http + os/exec surface
+## under Wasmer's WASIX is unverified — see docs/ARCHITECTURE.md §8 open
+## question #7. The native `build` target is the tested path.
+wasm:
+	GOOS=wasip1 GOARCH=wasm go build -o $(WASM) .
 
-## bench: measure agent spin-up performance (add DOCKER=1 for the Docker baseline)
-bench: guest
-	go run ./cmd/latigo-bench -wasm $(GUEST_WASM) -n 300 -cold-n 20 $(if $(DOCKER),-docker,)
+## run: run the harness natively against a local Mortise and workspace
+run: build
+	./$(BIN) "$(GOAL)"
 
-## test: run the full test suite (includes a real wasm run + replay)
+## test: run the full test suite (real shell, mock Mortise, event log)
 test:
 	go test ./...
-
-## conformance: run just the host conformance suite
-conformance:
-	go test ./host/ -run TestConformance -v
-
-## run: build the guest and run it with the reference host (mock LLM by default)
-run: guest host
-	./latigo-local -wasm $(GUEST_WASM) "$(GOAL)"
-
-## replay: reconstruct the last run from its event log
-replay: guest host
-	./latigo-local -wasm $(GUEST_WASM) -replay
 
 fmt:
 	gofmt -w .
@@ -40,5 +33,5 @@ vet:
 	go vet ./...
 
 clean:
-	rm -f $(GUEST_WASM) latigo-local latigo-bench latigo.events.jsonl
+	rm -f $(BIN) $(WASM) latigo.events.jsonl
 	rm -rf workspace

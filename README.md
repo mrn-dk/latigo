@@ -1,186 +1,95 @@
-# Latigo — Durable Agent Harness
+# Latigo — the agent harness
 
-Latigo is an independent, embeddable agent harness written in Go and compiled to
-WebAssembly (`wasip1`). It is **sandboxed by construction** (no direct network or
-disk), **deterministic**, and **reconstructable from its event log** on any
-conformant host.
+Latigo is **just the harness**: a WASM program run under Wasmer/WASIX that does
+three things — runs the agent in a loop, compacts the conversation, and emits the
+right events. Everything else (the host container, the warm pool, checkpoints,
+forking, the fleet) is owned by Stonewall and is out of scope here.
 
-The guest runs an agent loop with a virtual filesystem, a bash-like shell, on-
-demand markdown skills, and sandboxed Starlark script tools. It reaches the
-outside world only through a small, versioned ABI of host calls. Hosts implement
-that ABI; this repo owns the contract.
+## What it does
 
-## Repository layout
+- **Agent loop** with turn structure, argument validation before dispatch,
+  in-loop usage limits (`max_turns`, `max_total_tokens`, `max_tool_invocations`,
+  `max_wall_clock`), and a typed `finish` tool.
+- **Allow-listed shell** — the single surface the model uses to reach the host's
+  tools. The command line is parsed with [mvdan/sh] and the AST is walked; every
+  command node is verified against the allow-list before executing. Command
+  substitution and `eval` are hard rejects — never a fallback to a raw shell.
+  Pipes and redirection remain. The host (a Stonewall-managed container) owns
+  the image and the allow-list; Latigo respects what the host grants.
+- **OpenAI-compatible LLM client** — Latigo speaks the chat completions dialect
+  to *any* endpoint that implements it; it is not coupled to a specific gateway.
+- **Durable event log** — append-only JSONL, `fsync`'d before any result is
+  acted upon (write-ahead), carrying the conversation plus a thin operational
+  layer. Latigo is stateless between turns; resume means load the transcript
+  from the log, mount the workspace, continue. See [docs/EVENTS.md](docs/EVENTS.md).
 
-| Path | Artifact |
-|------|----------|
-| [`abi/`](abi) | ABI v0: the versioned host/guest contract as Go types |
-| [`events/`](events) | Durable event schema and checkpoint format |
-| [`guest/`](guest) | The in-guest harness: agent loop, VFS, virtual bash, skills, Starlark tools, tool registry |
-| [`cmd/latigo-guest/`](cmd/latigo-guest) | `main` compiled to WASM |
-| [`host/`](host) | Reference host library: dispatch, durability, replay, fs/llm/tools/exec/... handlers, wazero bridge |
-| [`cmd/latigo-local/`](cmd/latigo-local) | Reference local host CLI (local FS, OpenAI-compatible/Mortise LLM, JSONL log) |
-| [`cmd/latigo-bench/`](cmd/latigo-bench) | Spin-up benchmark harness (compile, warm/cold spin-up, Docker baseline) |
-| [`conformance/`](conformance) | Host conformance suite |
-| [`docs/`](docs) | [ABI spec](docs/ABI.md), [event schema](docs/EVENTS.md) |
+## Specification
+
+The authoritative specification is in [openspec/specs/](openspec/specs/):
+
+- [`agent-loop`](openspec/specs/agent-loop/spec.md) — the loop, tools, validation, limits
+- [`compaction`](openspec/specs/compaction/spec.md) — transcript compaction
+- [`event-log`](openspec/specs/event-log/spec.md) — the durable log and resume
+- [`shell`](openspec/specs/shell/spec.md) — the allow-listed shell
+- [`llm-client`](openspec/specs/llm-client/spec.md) — the OpenAI-compatible client
 
 ## Quick start
 
 ```sh
-# Build the guest to WebAssembly and the reference host.
-make guest host
+make build            # native binary (the tested path)
+make test             # real shell, mock endpoint, event log
 
-# Run with the built-in deterministic mock LLM (no network needed).
-./latigo-local -wasm latigo.wasm "list the files under /work"
+# Run against any OpenAI-compatible endpoint and a workspace, with a command allow-list:
+LATIGO_LLM_BASE_URL=http://localhost:8080/v1 \
+LATIGO_API_KEY=sk-... \
+LATIGO_WORKSPACE=./workspace \
+LATIGO_ALLOWLIST=./allowlist.example.json \
+  ./latigo "list the files under the workspace and report what you find"
 
-# Reconstruct the run from its durable event log — no re-execution.
-./latigo-local -wasm latigo.wasm -replay
+# Or a comma-separated allow-list:
+LATIGO_ALLOW=ls,cat,rg,grep ./latigo "find all TODO comments"
 
-# Use a real OpenAI-compatible endpoint (or Mortise):
-OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_API_KEY=sk-... \
-  ./latigo-local -wasm latigo.wasm -model gpt-4o-mini "summarise README"
-
-# Grant governed network access: curl / the http_fetch tool, allowlisted per host.
-./latigo-local -wasm latigo.wasm -http -http-allow 'api.github.com,*.example.com' \
-  "fetch https://api.github.com/zen and report it"
+# Resume a run that was interrupted mid-task:
+LATIGO_RESUME=1 ./latigo
 ```
 
-## Networking
-
-The guest has **no ambient network access**. The only way out is the governed
-`http.fetch` capability, which the host must explicitly grant and which it
-mediates on every request: scheme/method/host allowlisting, SSRF defence
-(private, loopback, and cloud-metadata addresses are blocked, with the resolved
-IP pinned to defeat DNS rebinding), a response-size cap, and request-header
-stripping. In the guest this surfaces as `curl`/`wget` in the virtual shell and
-an `http_fetch` tool — both thin wrappers over the one governed hostcall, so the
-*host* decides where requests may go, not the model. Because it is a hostcall,
-every response is recorded and replay-safe.
-
-`exec.run` (native process execution) is a separate, deny-by-default **ambient**
-capability that escapes these guarantees, so the reference host keeps it from
-becoming an ungoverned second egress: it requires an explicit command allowlist,
-never inherits the host environment, and network-isolates the child unless you
-opt into unsafe networked exec. Enabling it stamps the run as `ambient` in the
-event log. See [docs/ABI.md](docs/ABI.md#trust-tiers-and-the-single-egress-rule).
-
-## Compaction, checkpoints & subagents
-
-**Transcript compaction.** The in-guest agent loop manages its own context
-window through overridable strategy points: `ShouldCompact` (when), `Compact`
-(how), `EstimateTokens` (budget accounting), and `Summarize` (how the elided
-turns are condensed). By default `ShouldCompact` fires at ~80% of the advertised
-token budget (`Capabilities.MaxLLMTokens`, à la Claude Code's auto-compact),
-falling back to a message-count threshold when no budget is known; `Compact`
-keeps the system prompt and goal, replaces the middle via `Summarize`, and keeps
-the most recent turns verbatim.
-
-Two `Summarize` strategies ship, selectable with `-compaction`:
-
-- `window` (default) — a deterministic placeholder for the elided turns. No
-  hostcall, so it's free and trivially replay-safe.
-- `llm` — asks the model itself to write a structured briefing (files touched,
-  decisions, task state, TODOs). Because that summary is produced by an
-  `llm.call` hostcall, it is **recorded once and replayed verbatim** — so even
-  model-driven compaction stays deterministic on replay, which most harnesses
-  can't offer. It degrades to the deterministic placeholder on any error.
+### Building for WASM
 
 ```sh
-./latigo-local -wasm latigo.wasm -compaction llm "a long, context-heavy task"
+make wasm            # GOOS=wasip1 GOARCH=wasm → latigo.wasm
 ```
 
-All four are plain fields on `guest.Agent`, so an embedder can drop in its own
-policy (tool-output elision, externalising notes to the VFS, hierarchical
-summarisation, …) without touching the loop.
+The native `make build` path is the tested one; on a single host the OS plays
+the runtime's role and the same code runs unchanged. WASIX runtime behaviour
+under Wasmer (subprocess spawn, networking, quotas) is the host system's
+concern, not Latigo's.
 
-**Durable checkpoints & log compaction.** With the optional `checkpoint`
-capability the guest periodically snapshots its state (`state.checkpoint`) and
-restores it at startup (`state.restore`). The host records snapshots as
-`checkpoint` events, and `host.CompactLog` rewrites the log to the tail since the
-last checkpoint — so on replay the guest **resumes from the snapshot instead of
-re-running** the folded turns. Replay stays reconstruction, never re-execution;
-the log just stops growing without bound (and interrupted runs can resume).
+## Configuration
 
-```sh
-./latigo-local -wasm latigo.wasm "long task"   # checkpointing on by default
-./latigo-local -wasm latigo.wasm -compact       # compact the log to the last checkpoint
-./latigo-local -wasm latigo.wasm -replay         # bounded replay from the checkpoint
-```
+Latigo reads its run configuration from the environment (a WASIX program is
+launched with env + args by the orchestrator):
 
-**Subagents.** There is no subagent primitive in the ABI — orchestration is the
-host's business. Instead a host exposes subagents as an ordinary tool: the
-reference `-subagents` flag registers a `delegate` tool that spins up a fresh,
-isolated child guest to run a subtask to completion and returns its summary.
-Because per-agent spin-up is milliseconds, fanning out to short-lived subagents
-is cheap; and because the child's result is recorded as the parent's tool
-result, subagents are durable and replay-safe without re-running the child.
-Nesting is bounded by `-max-depth`.
-
-```sh
-./latigo-local -wasm latigo.wasm -subagents -max-depth 2 "research X, delegating subtasks"
-```
-
-Run everything (including a real wasm run + replay integration test):
-
-```sh
-make test
-```
-
-## Spin-up performance
-
-Latigo is designed so a host compiles the guest module **once** and then spins up
-many fresh, fully-isolated agents on demand. Because each agent is a new WASM
-instance (its own linear memory, VFS, and shell) rather than a new OS container,
-spin-up is measured in **milliseconds, not hundreds of milliseconds**.
-
-![Agent spin-up time vs Docker (p50, log scale)](docs/spinup.svg)
-
-Benchmark it yourself:
-
-```sh
-make bench            # compile + warm/cold spin-up
-make bench DOCKER=1   # also run the `docker run` baseline for comparison
-```
-
-Representative numbers on one x86-64 Linux dev machine (Go 1.25, wazero 1.12,
-9.0 MB guest module; p50 over 300/20 iterations):
-
-| Phase | What it measures | p50 |
-|-------|------------------|-----|
-| compile (one-time) | Compile the guest WASM to native code; done once per host process | ~2.5 s |
-| **spin-up: warm (per agent)** | **Instantiate a fresh, isolated sandbox from the hot module and boot the guest to ready** | **~10 ms** |
-| cold start (cached compile) | Fresh runtime + spin-up, reusing wazero's persisted compilation cache | ~87 ms |
-| cold start (compile + spin-up) | Fully cold path including a from-scratch compile | ~2.5 s |
-| `docker run --rm alpine true` | Start an empty container that does no work (baseline) | ~650 ms |
-
-The compile cost is paid **once** — at process start, or amortized across
-restarts via wazero's on-disk [compilation cache](https://pkg.go.dev/github.com/tetratelabs/wazero#NewCompilationCacheWithDir).
-After that, each new agent boots in **~10 ms — roughly 65× faster than merely
-starting an empty Docker container**, and the warm agent is already doing useful
-work (capability negotiation + first turn) while the container has only just
-reached its entrypoint. Absolute numbers vary by hardware; run `make bench` to
-reproduce on yours.
-
-## Design in one screen
-
-- **Transport.** One imported function, `latigo_abi.hostcall`, carries length-
-  prefixed JSON in the guest's linear memory. See [docs/ABI.md](docs/ABI.md).
-- **Namespaces.** `fs.*`, `llm.call`, `tool.list`/`tool.invoke`, `exec.run`
-  (optional), `msg.send`/`msg.recv`, `approval.await`, `log.append`, and host-
-  injected `clock.now`/`rand.bytes`.
-- **Capability negotiation** happens at instantiation; the guest degrades
-  gracefully when an optional capability is absent.
-- **Durability.** Write-ahead: every hostcall result is appended, flushed, and
-  fsynced before the guest observes it. Events carry harness-version stamps.
-  Periodic checkpoints enable compaction and bounded replay. **Replay is state
-  reconstruction from recorded results — never re-execution.** See
-  [docs/EVENTS.md](docs/EVENTS.md).
-- **In-guest.** Agent loop with configurable strategy points (compaction,
-  termination); virtual bash + VFS (`mvdan/sh` + `afero`); skills as on-demand
-  markdown; Starlark script tools with step/output budgets; tool catalog
-  received from the host.
+| Variable | Default | Meaning |
+|---|---|---|
+| `LATIGO_GOAL` / arg[1] | — | the task |
+| `LATIGO_MODEL` | `gpt-4o-mini` | model name passed to the endpoint |
+| `LATIGO_LLM_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible base URL |
+| `LATIGO_API_KEY` | — | bearer token (secrets never enter the sandbox in the full architecture) |
+| `LATIGO_WORKSPACE` | `./workspace` | mounted workspace directory |
+| `LATIGO_EVENT_LOG` | `./latigo.events.jsonl` | append-only event log path |
+| `LATIGO_ALLOWLIST` | — | path to an allow-list JSON (see `allowlist.example.json`) |
+| `LATIGO_ALLOW` | — | comma-separated command allow-list (alternative) |
+| `LATIGO_OUTPUT_SCHEMA` | — | optional JSON Schema for the `finish` tool's output |
+| `LATIGO_RESUME` | `0` | `1`/`true` continues the last run from its log |
+| `LATIGO_COMPACTION` | `window` | `window` (deterministic) or `llm` (model-driven summary) |
+| `LATIGO_MAX_TURNS` | `16` | usage limit |
+| `LATIGO_MAX_TOTAL_TOKENS` | `0` = unlimited | usage limit |
+| `LATIGO_MAX_TOOL_INVOCATIONS` | `0` = unlimited | usage limit |
+| `LATIGO_MAX_WALL_CLOCK_S` | `1800` | usage limit |
+| `LATIGO_SHELL_EXEC_TIMEOUT_S` | `60` | per-leaf-command timeout |
 
 ## Requirements
 
-Go 1.25+ (the wazero host runtime requires it; the toolchain is auto-selected via
-`go.mod`).
+Go 1.25+ (the `mvdan.cc/sh/v3` dependency requires it).
+
+[mvdan/sh]: https://github.com/mvdan/sh

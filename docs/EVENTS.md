@@ -1,95 +1,92 @@
-# Latigo Event Schema & Checkpoints — v0
+# Latigo event log
 
-The event log is the source of truth for a Latigo run. The Go types live in the
-[`events`](../events) package. The reference host writes the log as **JSONL**
-(one `Event` per line).
+The event log is append-only JSONL, `fsync`'d before any result is acted upon
+(write-ahead). It carries the conversation **plus** a thin operational layer.
+There is no replay engine: Latigo is stateless between turns, and resume means
+*load the transcript, mount the workspace, continue* — reading the recorded
+conversation back out of the log, not re-executing it.
 
-## Durability model
-
-**Write-ahead.** Every hostcall result is appended to the log *and flushed +
-fsynced* before the guest is allowed to observe it. If the process dies between
-the side effect and the ack, the run can be resumed or replayed without
-re-executing the side effect.
-
-**Replay is reconstruction, never re-execution.** During replay the host returns
-the recorded response for each hostcall in order; handlers are not invoked. A
-divergence (the guest issuing a different op than recorded) is reported as an
-`internal` error, which detects non-determinism and cross-version drift.
-
-## Event envelope
+## Record shape
 
 ```json
-{
-  "seq": 1,
-  "kind": "hostcall",
-  "time": "2026-01-01T00:00:00Z",
-  "harness_version": "latigo-local/0.0.0",
-  "schema_version": "0",
-  "payload": { ... }
-}
+{"seq":1,"kind":"run_start","time":"...","harness":"latigo/0.2.0","payload":{...}}
 ```
 
-`seq` increases strictly. `harness_version` stamps who produced the event so
-cross-version migration is possible.
+| field    | meaning                                                       |
+|----------|---------------------------------------------------------------|
+| `seq`    | strictly increasing sequence number                           |
+| `kind`   | one of the kinds below                                        |
+| `time`   | RFC3339 UTC                                                   |
+| `harness`| harness version stamp                                         |
+| `payload`| kind-specific JSON object (see below)                         |
 
-## Event kinds
+## Kinds
 
-| Kind | Payload | Meaning |
-|------|---------|---------|
-| `run_start` | `RunStart` | First event: run id, ABI version, negotiated capabilities, goal |
-| `hostcall` | `Hostcall` | A completed hostcall: op, request bytes, response bytes (write-ahead) |
-| `catalog` | `Catalog` | A tool-catalog snapshot; catalog changes arrive as events, so catalogs are replay-safe |
-| `checkpoint` | `Checkpoint` | An opaque, guest-defined state snapshot for compaction and bounded replay |
-| `run_end` | `RunEnd` | Final event: termination reason and error, if any |
+### `run_start`
+```json
+{"run_id":"run-...","goal":"...","model":"...","llm_base_url":"...",
+ "grants":{"workspace":"/workspace","net":["llm.example"],"commands":["rg","pytest"]},
+ "config":{...limits...}}
+```
 
-## Checkpoints & compaction
+### `turn` — a turn boundary, recorded at the top of each turn.
+```json
+{"turn":0}
+```
 
-Checkpointing is an optional capability (`Capabilities.Checkpoint`). When the
-host grants it, the guest periodically calls **`state.checkpoint`** with an
-opaque, restorable snapshot of its state (transcript, virtual filesystem
-contents, and the current turn — see the guest's `agentSnapshot`). The host
-records each as a `checkpoint` event carrying `since_seq` and the `state` blob.
-`state.checkpoint` is written as a `checkpoint` event, not a `hostcall`, so the
-snapshot bytes are not duplicated into the hostcall stream.
+### `llm` — one chat-completion result; the assistant message is recorded
+verbatim so the transcript can be rebuilt by reading the log.
+```json
+{"turn":0,"model":"...","latency_ms":420,"input_tokens":120,"output_tokens":30,
+ "total_tokens":150,"finish_reason":"tool_calls",
+ "message":{"role":"assistant","content":"...","tool_calls":[...]}}
+```
 
-At startup the guest calls **`state.restore`** (always its second hostcall,
-after `tool.list`). On a fresh run this returns `found: false` and the guest
-starts normally. On a resumed or compacted run it returns the latest snapshot,
-and the guest rehydrates and continues from the recorded turn.
+### `tool` — tool/exec intent and result, with an idempotency key.
+Intent is recorded **before** dispatch; the result shares the key + call id.
+```json
+{"call_id":"call-1","idempotency_key":"a1b2c3d4","name":"shell","args":{...},
+ "status":"intent"}
+{"call_id":"call-1","idempotency_key":"a1b2c3d4","name":"shell",
+ "status":"ok","exit_code":0,"stdout":"...","stderr":"...","latency_ms":3}
+```
+`status` ∈ `intent` | `ok` | `error` | `invalid` | `denied`.
 
-**Compaction** (`host.CompactLog`) rewrites the log to the tail since the most
-recent checkpoint: it keeps `run_start`, the guest's initial `tool.list` and
-`state.restore` (rewriting the latter to hand back the snapshot), every event
-after the checkpoint, and `run_end` — dropping the hostcalls of all folded
-turns. On replay the guest restores from the snapshot instead of re-running
-those turns, so **replay stays reconstruction, never re-execution**, while the
-log is bounded. To keep replay aligned, the reference host injects a synthetic
-journal entry for each retained checkpoint (the guest re-issues `state.checkpoint`
-at the same points), and skips re-emitting the boundary checkpoint it resumed
-from.
+### `finish` — the validated final output (from the `finish` tool, or a plain
+assistant answer).
+```json
+{"output":"...","valid":true,"errors":[]}
+```
 
-This is what makes long-running agents practical: the log does not grow without
-bound, and an interrupted run can resume from its last snapshot.
+### `turn_end` — end-of-turn marker. `checkpoint_id` is assigned by the
+orchestrator (Stonewall); it is empty on the single-host path, where the log
+and workspace *are* the recoverable state. `egress` lists the destinations
+reached this turn.
+```json
+{"turn":0,"checkpoint_id":"","egress":["llm.example"]}
+```
 
-## Durable actors: park & reactivate
+### `run_end`
+```json
+{"reason":"finished","error":""}
+```
+`reason` ∈ `finished` | `answered` | `max_turns` | `max_total_tokens` |
+`max_tool_invocations` | `max_wall_clock` | `llm_error` | `dispatch_error`.
 
-Checkpointing also underpins the **durable-actor** lifecycle, where an agent is
-never destroyed — it computes, returns a result, and is *parked* as a checkpoint
-blob the host stores (e.g. in a database) with zero running footprint.
+### `log` — operational notes (validation failures, etc.) that are not part of
+the conversation.
+```json
+{"level":"warn","message":"tool args validation failed","fields":{...}}
+```
 
-- **Checkpoint on terminate.** When a run finishes, the guest emits a final
-  `state.checkpoint` capturing its completed state (`done`, `summary`, transcript,
-  virtual filesystem). This is the up-to-date blob the host parks. (It is skipped
-  when an activation did no work — e.g. a pure bounded-replay reconstruction —
-  so it never diverges from a compacted journal.)
-- **Reactivation.** To re-task a parked agent, the host resumes it as a *new
-  activation*: `state.restore` returns `reactivate: true` and an `input` string.
-  The guest clears its terminal state, appends `input` as a new user turn, keeps
-  its prior transcript and filesystem, and runs again with a fresh turn budget.
-  The new activation records its own log and, on completion, parks again.
+## Transcript rebuild (resume)
 
-Both flavours of `state.restore` — bounded-replay/crash *resume* (`reactivate:
-false`) and *reactivation* (`reactivate: true`) — are ordinary recorded
-hostcalls, so each activation is independently replayable. Identity, storage of
-blobs, and single-writer scheduling across many agents are host concerns; the
-ABI stays free of leases and tenants.
+`LoadTranscript` reads the log and rebuilds the conversation:
+- `run_start` → the goal and model;
+- each `llm` event → one assistant message (with any `tool_calls`);
+- each terminal `tool` event (`ok`/`error`/`invalid`/`denied`) → one
+  tool-role message, deduplicated by `call_id`.
+
+`intent`-only tool events, `turn`, `turn_end`, `run_end`, and `log` events are
+skipped. The system prompt is supplied by the caller; everything else comes
+from the log.
