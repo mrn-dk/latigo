@@ -69,6 +69,17 @@ type chatRequest struct {
 	Tools       []ToolSpec    `json:"tools,omitempty"`
 	Temperature float64       `json:"temperature,omitempty"`
 	MaxTokens   int           `json:"max_tokens,omitempty"`
+	// Stream requests the OpenAI SSE delta stream. The streaming path sets this
+	// and StreamOptions; the non-streaming path leaves both zero.
+	Stream        bool           `json:"stream,omitempty"`
+	StreamOptions *streamOptions `json:"stream_options,omitempty"`
+}
+
+// streamOptions asks the endpoint to include a final usage chunk in the SSE
+// stream. Many endpoints omit usage from a stream unless asked; we always
+// request it and fall back to an estimate when it is absent.
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // messageWire is the on-the-wire message shape. Tool-role messages carry
