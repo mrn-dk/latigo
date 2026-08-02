@@ -1,0 +1,19 @@
+{
+  "commands": [
+    {"name": "ls",    "one_line": "list directory contents"},
+    {"name": "cat",   "one_line": "print files"},
+    {"name": "rg",    "one_line": "ripgrep — search file contents"},
+    {"name": "grep",  "one_line": "search file contents"},
+    {"name": "find",  "one_line": "find files by name/attrs"},
+    {"name": "wc",    "one_line": "count lines/words/bytes"},
+    {"name": "sort",  "one_line": "sort lines"},
+    {"name": "head",  "one_line": "first lines of files"},
+    {"name": "tail",  "one_line": "last lines of files"},
+    {"name": "mkdir", "one_line": "make directories"},
+    {"name": "cp",    "one_line": "copy files"},
+    {"name": "mv",    "one_line": "move/rename files"},
+    {"name": "rm",    "one_line": "remove files"},
+    {"name": "pytest","one_line": "run the Python test suite", "help": "pytest -q"},
+    {"name": "git",   "one_line": "version control (read-only ops suggested)"}
+  ]
+}
