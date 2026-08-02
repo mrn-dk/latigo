@@ -52,6 +52,58 @@ type EventLog struct {
 	w    *bufio.Writer
 	seq  uint64
 	path string
+
+	// tail caches the high-water marks read from the log as it stood when it
+	// was opened, so the resume path derives both counters from one scan.
+	tail *logTail
+}
+
+// logTail is what an existing log says about where to continue: the highest
+// sequence number and the highest turn number it records. Both are needed on
+// the same path, so one pass produces both.
+type logTail struct {
+	seq  uint64
+	turn int
+}
+
+// scanTail reads the existing log once and returns its high-water marks,
+// caching the result: the file does not change under us between opening it and
+// our first append. Returns zeroes for a fresh or unreadable log.
+func (l *EventLog) scanTail() (logTail, error) {
+	if l.tail != nil {
+		return *l.tail, nil
+	}
+	var t logTail
+	in, err := os.Open(l.path)
+	if err != nil {
+		l.tail = &t
+		return t, nil
+	}
+	defer in.Close()
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		var e Event
+		if json.Unmarshal(sc.Bytes(), &e) != nil {
+			continue
+		}
+		if e.Seq > t.seq {
+			t.seq = e.Seq
+		}
+		switch e.Kind {
+		case KindTurn, KindTurnEnd, KindLLM:
+			// All three payloads carry the turn number under "turn".
+			var p TurnPayload
+			if json.Unmarshal(e.Payload, &p) == nil && p.Turn > t.turn {
+				t.turn = p.Turn
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return t, err
+	}
+	l.tail = &t
+	return t, nil
 }
 
 // OpenEventLog opens (or creates) an event log for appending.
@@ -66,21 +118,16 @@ func OpenEventLog(path string) (*EventLog, error) {
 // lastSeq reads the existing log to find the highest sequence number, so a
 // resumed run continues numbering monotonically. Returns 0 for a fresh log.
 func (l *EventLog) lastSeq() (uint64, error) {
-	in, err := os.Open(l.path)
-	if err != nil {
-		return 0, nil
-	}
-	defer in.Close()
-	var max uint64
-	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 64*1024), 8*1024*1024)
-	for sc.Scan() {
-		var e Event
-		if json.Unmarshal(sc.Bytes(), &e) == nil && e.Seq > max {
-			max = e.Seq
-		}
-	}
-	return max, sc.Err()
+	t, err := l.scanTail()
+	return t.seq, err
+}
+
+// lastTurn reads the existing log to find the highest turn number it records,
+// so a resumed run continues turn numbering rather than restarting it. Returns
+// 0 for a log with no recorded turns, whose first turn is therefore 1.
+func (l *EventLog) lastTurn() (int, error) {
+	t, err := l.scanTail()
+	return t.turn, err
 }
 
 // ResumeSeq sets the sequence counter to continue after an existing log.
@@ -91,6 +138,14 @@ func (l *EventLog) ResumeSeq() error {
 	}
 	l.seq = n
 	return nil
+}
+
+// ResumeTurn returns the turn number a resumed run continues from: the highest
+// turn the log records, so the run's first turn is one greater. The counter
+// itself lives on the agent (the log records turn numbers but does not assign
+// them), which is why this returns a value where ResumeSeq sets one.
+func (l *EventLog) ResumeTurn() (int, error) {
+	return l.lastTurn()
 }
 
 // Append writes one event, flushes, and fsyncs. Write-ahead: a caller must

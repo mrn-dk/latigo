@@ -38,7 +38,17 @@ type Agent struct {
 	tb       timebomb
 
 	// usage counters
-	turns           int
+	//
+	// turnsThisRun and turnNumber are deliberately two fields, because they are
+	// two quantities. turnsThisRun is the *budget*: it counts the turns taken by
+	// this run, is what max_turns is measured against, and starts at zero on
+	// every run, so a resumed run gets its full budget. turnNumber is the
+	// *identity*: it names a turn within the agent's whole life, is stamped on
+	// emitted events, and continues across resume — restored from the log by
+	// ResumeTurn, never reset. One counter serving both meanings is what made a
+	// resumed run re-emit turn numbers its log already contained.
+	turnsThisRun    int
+	turnNumber      int
 	totalTokens     int
 	toolInvocations int
 
@@ -137,7 +147,7 @@ func (a *Agent) Run(ctx context.Context) (string, string, error) {
 		return "", "log_error", err
 	}
 
-	for a.turns < a.cfg.MaxTurns {
+	for a.turnsThisRun < a.cfg.MaxTurns {
 		if a.tb.expired() {
 			return a.terminate("max_wall_clock", "")
 		}
@@ -147,7 +157,13 @@ func (a *Agent) Run(ctx context.Context) (string, string, error) {
 		if a.cfg.MaxToolInvocations > 0 && a.toolInvocations > a.cfg.MaxToolInvocations {
 			return a.terminate("max_tool_invocations", "")
 		}
-		if _, err := a.log.Append(KindTurn, TurnPayload{Turn: a.turns}); err != nil {
+		// Spend one turn of this run's budget and take the next turn number.
+		// `turn` names this turn everywhere below, so the turn-end marker
+		// cannot drift from the turn it closes.
+		a.turnsThisRun++
+		a.turnNumber++
+		turn := a.turnNumber
+		if _, err := a.log.Append(KindTurn, TurnPayload{Turn: turn}); err != nil {
 			return "", "log_error", err
 		}
 		if a.ShouldCompact(a, a.messages) {
@@ -165,7 +181,7 @@ func (a *Agent) Run(ctx context.Context) (string, string, error) {
 		}
 		a.messages = append(a.messages, resp.Message)
 		if _, err := a.log.Append(KindLLM, LLMPayload{
-			Turn:         a.turns,
+			Turn:         turn,
 			Model:        resp.Model,
 			LatencyMS:    resp.Latency.Milliseconds(),
 			InputTokens:  resp.InputTokens,
@@ -177,7 +193,6 @@ func (a *Agent) Run(ctx context.Context) (string, string, error) {
 			return "", "log_error", err
 		}
 		a.totalTokens += resp.TotalTokens
-		a.turns++
 
 		if len(resp.Message.ToolCalls) == 0 {
 			// The model produced a final answer without calling finish.
@@ -203,7 +218,7 @@ func (a *Agent) Run(ctx context.Context) (string, string, error) {
 		// orchestrator (Stonewall); on the single-host path it is empty and
 		// the log + workspace remain the recoverable state.
 		if _, err := a.log.Append(KindTurnEnd, TurnEndPayload{
-			Turn:   a.turns - 1,
+			Turn:   turn,
 			Egress: []string{a.cfg.LLMBaseURL},
 		}); err != nil {
 			return "", "log_error", err
@@ -234,9 +249,17 @@ func (a *Agent) bootstrap() error {
 		if lt.RunID != "" {
 			a.runID = lt.RunID
 		}
+		// Continue both numberings from what the log already records: the
+		// sequence counter on the log, the turn number here. Deriving them from
+		// the durable record is what makes them impossible to restart.
 		if err := a.log.ResumeSeq(); err != nil {
 			return err
 		}
+		lastTurn, err := a.log.ResumeTurn()
+		if err != nil {
+			return err
+		}
+		a.turnNumber = lastTurn
 		return nil
 	}
 	a.messages = []Message{
