@@ -47,6 +47,11 @@ type Agent struct {
 	finishOutput  json.RawMessage
 	finishInvalid [][]string
 
+	// DeltaSink, when non-nil, receives text deltas during a streamed chat
+	// completion. Set it to stream the model's output to a live consumer. It is
+	// an ephemeral output path; the assembled message is still the record.
+	DeltaSink DeltaSink
+
 	// Strategy points (overridable), see compaction.go.
 	SystemPrompt   string
 	ShouldCompact  func(a *Agent, msgs []Message) bool
@@ -230,12 +235,18 @@ func (a *Agent) bootstrap() error {
 	return nil
 }
 
-// callLLM performs one chat completion against the endpoint.
+// callLLM performs one chat completion against the endpoint. When streaming is
+// enabled it uses the streaming path and forwards text deltas to a.DeltaSink;
+// otherwise it uses the plain non-streaming path. Both return the same
+// LLMResult, so the loop and event log are unchanged by how the bytes arrive.
 func (a *Agent) callLLM(ctx context.Context) (LLMResult, error) {
 	req := chatRequest{
 		Model:    a.cfg.Model,
 		Messages: wireMessages(a.messages),
 		Tools:    toolSpecs(a.tools),
+	}
+	if a.cfg.Stream {
+		return a.llm.CallStream(ctx, req, a.DeltaSink)
 	}
 	return a.llm.Call(ctx, req)
 }

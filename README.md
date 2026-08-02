@@ -18,6 +18,9 @@ forking, the fleet) is owned by Stonewall and is out of scope here.
   the image and the allow-list; Latigo respects what the host grants.
 - **OpenAI-compatible LLM client** — Latigo speaks the chat completions dialect
   to *any* endpoint that implements it; it is not coupled to a specific gateway.
+  Streaming is opt-in (`LATIGO_STREAM=1`): text deltas are forwarded to an
+  optional sink as they arrive, while the assembled message remains the unit of
+  transcript and logging.
 - **Durable event log** — append-only JSONL, `fsync`'d before any result is
   acted upon (write-ahead), carrying the conversation plus a thin operational
   layer. Latigo is stateless between turns; resume means load the transcript
@@ -32,6 +35,9 @@ The authoritative specification is in [openspec/specs/](openspec/specs/):
 - [`event-log`](openspec/specs/event-log/spec.md) — the durable log and resume
 - [`shell`](openspec/specs/shell/spec.md) — the allow-listed shell
 - [`llm-client`](openspec/specs/llm-client/spec.md) — the OpenAI-compatible client
+
+Proposed changes live in [openspec/changes/](openspec/changes/) — notably
+[add-streaming](openspec/changes/add-streaming/) for streaming chat completions.
 
 ## Quick start
 
@@ -81,6 +87,7 @@ launched with env + args by the orchestrator):
 | `LATIGO_ALLOW` | — | comma-separated command allow-list (alternative) |
 | `LATIGO_OUTPUT_SCHEMA` | — | optional JSON Schema for the `finish` tool's output |
 | `LATIGO_RESUME` | `0` | `1`/`true` continues the last run from its log |
+| `LATIGO_STREAM` | `0` | `1`/`true` streams chat completions (text deltas to a sink; the assembled message is still the record) |
 | `LATIGO_COMPACTION` | `window` | `window` (deterministic) or `llm` (model-driven summary) |
 | `LATIGO_MAX_TURNS` | `16` | usage limit |
 | `LATIGO_MAX_TOTAL_TOKENS` | `0` = unlimited | usage limit |

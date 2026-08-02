@@ -42,6 +42,10 @@ type Config struct {
 	// Compaction selects the transcript compaction strategy: "window" (default,
 	// deterministic) or "llm" (model-driven summarisation).
 	Compaction string
+	// Stream enables streaming chat completions (stream: true) with text
+	// deltas forwarded to DeltaSink as they arrive. Off by default; when on, the
+	// assembled message is still the unit of transcript and logging.
+	Stream bool
 
 	// Usage limits (spec §2.5), enforced in-loop.
 	MaxTurns            int
@@ -77,6 +81,7 @@ const (
 	EnvOutputSchema = "LATIGO_OUTPUT_SCHEMA"
 	EnvResume       = "LATIGO_RESUME"
 	EnvCompaction   = "LATIGO_COMPACTION"
+	EnvStream       = "LATIGO_STREAM"
 	EnvMaxTurns     = "LATIGO_MAX_TURNS"
 	EnvMaxTokens    = "LATIGO_MAX_TOTAL_TOKENS"
 	EnvMaxTools     = "LATIGO_MAX_TOOL_INVOCATIONS"
@@ -117,6 +122,9 @@ func LoadConfig() (Config, error) {
 	if v := os.Getenv(EnvResume); v == "1" || strings.EqualFold(v, "true") {
 		cfg.Resume = true
 	}
+	if v := os.Getenv(EnvStream); v == "1" || strings.EqualFold(v, "true") {
+		cfg.Stream = true
+	}
 	cfg.MaxTurns = envInt(EnvMaxTurns, cfg.MaxTurns)
 	cfg.MaxTotalTokens = envInt(EnvMaxTokens, cfg.MaxTotalTokens)
 	cfg.MaxToolInvocations = envInt(EnvMaxTools, cfg.MaxToolInvocations)
@@ -149,6 +157,7 @@ func envInt(name string, def int) int {
 // configSummary is the shape recorded in the run_start event.
 type configSummary struct {
 	Compaction              string `json:"compaction,omitempty"`
+	Stream                  bool   `json:"stream,omitempty"`
 	MaxTurns                int    `json:"max_turns,omitempty"`
 	MaxTotalTokens          int    `json:"max_total_tokens,omitempty"`
 	MaxToolInvocations      int    `json:"max_tool_invocations,omitempty"`
@@ -159,6 +168,7 @@ type configSummary struct {
 func (c Config) summary() json.RawMessage {
 	s := configSummary{
 		Compaction:              c.Compaction,
+		Stream:                  c.Stream,
 		MaxTurns:                c.MaxTurns,
 		MaxTotalTokens:          c.MaxTotalTokens,
 		MaxToolInvocations:      c.MaxToolInvocations,

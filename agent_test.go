@@ -11,6 +11,39 @@ import (
 	"testing"
 )
 
+// sseWrite writes one OpenAI-style SSE data line + the terminating DONE marker.
+func sseWrite(w http.ResponseWriter, chunks ...string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(200)
+	for _, c := range chunks {
+		w.Write([]byte("data: " + c + "\n\n"))
+	}
+	w.Write([]byte("data: [DONE]\n\n"))
+}
+
+// newMockSSEEndpoint serves scripted SSE streams, one per request.
+type mockSSEEndpoint struct {
+	server  *httptest.Server
+	scripts [][]string
+	calls   atomic.Int32
+}
+
+func newMockSSEEndpoint(t *testing.T, scripts ...[]string) *mockSSEEndpoint {
+	m := &mockSSEEndpoint{scripts: scripts}
+	m.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		i := int(m.calls.Add(1)) - 1
+		if i < len(m.scripts) {
+			sseWrite(w, m.scripts[i]...)
+			return
+		}
+		sseWrite(w, `{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(m.server.Close)
+	return m
+}
+
+func (m *mockSSEEndpoint) URL() string { return m.server.URL + "/v1" }
+
 type mockEndpoint struct {
 	server  *httptest.Server
 	calls   atomic.Int32
@@ -185,6 +218,51 @@ func TestAgentMaxTurnsTerminates(t *testing.T) {
 	}
 	if reason != "max_turns" {
 		t.Fatalf("reason=%q", reason)
+	}
+}
+
+func TestAgentStreamEndToEndSinkAndLog(t *testing.T) {
+	// Two streamed turns: turn 0 streams text + a shell tool call; turn 1
+	// streams a finish.
+	sh := []string{
+		`{"choices":[{"index":0,"delta":{"content":"let me "},"finish_reason":null}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"check"},"finish_reason":null}]}`,
+		`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}}]},"finish_reason":"tool_calls"}]}`,
+	}
+	fin := []string{
+		`{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}`,
+		`{"choices":[],"model":"mock-model","usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}`,
+	}
+	sse := newMockSSEEndpoint(t, sh, fin)
+	agent := setupAgent(t, Config{Goal: "stream then finish", Stream: true})
+	agent.llm.BaseURL = sse.URL()
+	writeFile(t, filepath.Join(agent.cfg.Workspace, "note.txt"), "hi\n")
+
+	var sinkGot strings.Builder
+	agent.DeltaSink = func(text string) { sinkGot.WriteString(text) }
+
+	out, reason, err := agent.Run(t.Context())
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if reason != "answered" {
+		t.Fatalf("reason=%q out=%q", reason, out)
+	}
+	// The sink saw the streamed text from both turns.
+	if sinkGot.String() != "let me checkdone" {
+		t.Fatalf("sink=%q want %q", sinkGot.String(), "let me checkdone")
+	}
+	// The event log's llm events carry the full assembled messages, not deltas.
+	lt, _ := LoadTranscript(agent.cfg.EventLog)
+	if len(lt.Messages) < 2 {
+		t.Fatalf("transcript too short: %+v", lt.Messages)
+	}
+	first := lt.Messages[0]
+	if first.Role != "assistant" || first.Content != "let me check" || len(first.ToolCalls) != 1 {
+		t.Fatalf("first llm event wrong: %+v", first)
+	}
+	if first.ToolCalls[0].Function.Name != "shell" || first.ToolCalls[0].Function.Arguments != `{"command":"ls"}` {
+		t.Fatalf("assembled tool call wrong: %+v", first.ToolCalls[0])
 	}
 }
 

@@ -90,3 +90,14 @@ the conversation.
 `intent`-only tool events, `turn`, `turn_end`, `run_end`, and `log` events are
 skipped. The system prompt is supplied by the caller; everything else comes
 from the log.
+
+## Streaming and the log
+
+When chat completions are streamed (`LATIGO_STREAM=1`), the SSE text deltas
+are an **ephemeral output path**: they are forwarded to an optional sink for
+live display and are **never written to the event log**. The durable record of
+a streamed turn is exactly one `llm` event carrying the fully assembled
+assistant message and usage — identical to a non-streamed turn. Tool calls are
+dispatched only after the stream is fully assembled, so tool-call arguments are
+complete before dispatch. This keeps the log and the transcript format
+unchanged whether or not streaming is on.
