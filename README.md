@@ -24,20 +24,7 @@ forking, the fleet) is owned by Stonewall and is out of scope here.
 - **Durable event log** — append-only JSONL, `fsync`'d before any result is
   acted upon (write-ahead), carrying the conversation plus a thin operational
   layer. Latigo is stateless between turns; resume means load the transcript
-  from the log, mount the workspace, continue. See [docs/EVENTS.md](docs/EVENTS.md).
-
-## Specification
-
-The authoritative specification is in [openspec/specs/](openspec/specs/):
-
-- [`agent-loop`](openspec/specs/agent-loop/spec.md) — the loop, tools, validation, limits
-- [`compaction`](openspec/specs/compaction/spec.md) — transcript compaction
-- [`event-log`](openspec/specs/event-log/spec.md) — the durable log and resume
-- [`shell`](openspec/specs/shell/spec.md) — the allow-listed shell
-- [`llm-client`](openspec/specs/llm-client/spec.md) — the OpenAI-compatible client
-
-Proposed changes live in [openspec/changes/](openspec/changes/) — notably
-[add-streaming](openspec/changes/add-streaming/) for streaming chat completions.
+  from the log, mount the workspace, continue.
 
 ## Quick start
 
@@ -94,6 +81,43 @@ launched with env + args by the orchestrator):
 | `LATIGO_MAX_TOOL_INVOCATIONS` | `0` = unlimited | usage limit |
 | `LATIGO_MAX_WALL_CLOCK_S` | `1800` | usage limit |
 | `LATIGO_SHELL_EXEC_TIMEOUT_S` | `60` | per-leaf-command timeout |
+
+## Event log
+
+The event log is append-only JSONL, `fsync`'d before any result is acted upon
+(write-ahead). It carries the conversation **plus** a thin operational layer.
+There is no replay engine: Latigo is stateless between turns, and resume means
+*load the transcript, mount the workspace, continue* — reading the recorded
+conversation back out of the log, not re-executing it.
+
+**Record shape:**
+
+```json
+{"seq":1,"kind":"run_start","time":"...","harness":"latigo/0.2.0","payload":{...}}
+```
+
+| field    | meaning                                                       |
+|----------|---------------------------------------------------------------|
+| `seq`    | strictly increasing sequence number                           |
+| `kind`   | one of the kinds below                                        |
+| `time`   | RFC3339 UTC                                                   |
+| `harness`| harness version stamp                                         |
+| `payload`| kind-specific JSON object (see below)                         |
+
+**Kinds:**
+
+- `run_start` — `{"run_id":"run-...","goal":"...","model":"...","llm_base_url":"...","grants":{"workspace":"/workspace","net":["llm.example"],"commands":["rg","pytest"]},"config":{...limits...}}`
+- `turn` — a turn boundary, recorded at the top of each turn: `{"turn":0}`
+- `llm` — one chat-completion result; the assistant message is recorded verbatim so the transcript can be rebuilt by reading the log: `{"turn":0,"model":"...","latency_ms":420,"input_tokens":120,"output_tokens":30,"total_tokens":150,"finish_reason":"tool_calls","message":{"role":"assistant","content":"...","tool_calls":[...]}}`
+- `tool` — tool/exec intent and result, with an idempotency key. Intent is recorded **before** dispatch; the result shares the key + call id. `status` ∈ `intent` | `ok` | `error` | `invalid` | `denied`.
+- `finish` — the validated final output: `{"output":"...","valid":true,"errors":[]}`
+- `turn_end` — end-of-turn marker. `checkpoint_id` is assigned by the orchestrator; it is empty on the single-host path, where the log and workspace *are* the recoverable state. `egress` lists the destinations reached this turn.
+- `run_end` — `{"reason":"finished","error":""}` where `reason` ∈ `finished` | `answered` | `max_turns` | `max_total_tokens` | `max_tool_invocations` | `max_wall_clock` | `llm_error` | `dispatch_error`.
+- `log` — operational notes (validation failures, etc.) that are not part of the conversation.
+
+**Transcript rebuild (resume):** `LoadTranscript` reads the log and rebuilds the conversation — `run_start` → the goal and model; each `llm` event → one assistant message (with any `tool_calls`); each terminal `tool` event (`ok`/`error`/`invalid`/`denied`) → one tool-role message, deduplicated by `call_id`. `intent`-only tool events, `turn`, `turn_end`, `run_end`, and `log` events are skipped. The system prompt is supplied by the caller; everything else comes from the log.
+
+**Streaming and the log:** when chat completions are streamed (`LATIGO_STREAM=1`), the SSE text deltas are an **ephemeral output path** — forwarded to an optional sink for live display and **never written to the event log**. The durable record of a streamed turn is exactly one `llm` event carrying the fully assembled assistant message and usage, identical to a non-streamed turn. Tool calls are dispatched only after the stream is fully assembled, so tool-call arguments are complete before dispatch.
 
 ## Requirements
 

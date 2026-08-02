@@ -12,17 +12,16 @@ build:
 	go build -o $(BIN) .
 
 ## wasm: compile to WebAssembly (WASI Preview 1; runs under a WASIX runtime).
-## NOTE: this compiles cleanly today, but Go's wasip1 net/http + os/exec surface
-## under Wasmer's WASIX is unverified — see docs/ARCHITECTURE.md §8 open
-## question #7. The native `build` target is the tested path.
+## The native `build` target is the tested path; WASIX runtime behaviour under
+## Wasmer is the host system's concern, not Latigo's.
 wasm:
 	GOOS=wasip1 GOARCH=wasm go build -o $(WASM) .
 
-## run: run the harness natively against a local Mortise and workspace
+## run: run the harness natively against a local endpoint and workspace
 run: build
 	./$(BIN) "$(GOAL)"
 
-## test: run the full test suite (real shell, mock Mortise, event log)
+## test: run the full test suite (real shell, mock endpoint, event log)
 test:
 	go test ./...
 
