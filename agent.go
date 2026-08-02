@@ -71,7 +71,18 @@ func NewAgent(cfg Config, llm *LLMClient, shell *Shell, allow *Allowlist, log *E
 		outputSchema: outputSchema,
 		tb:           newTimebomb(time.Duration(cfg.MaxWallClockSeconds) * time.Second),
 	}
-	a.SystemPrompt = defaultSystemPrompt
+	// Resolve the system prompt: a full override replaces the default; an
+	// append block is concatenated after the base (default or override) with a
+	// blank-line separator. The result is opaque text — the harness does not
+	// merge tool descriptions into a custom prompt.
+	base := defaultSystemPrompt
+	if cfg.SystemPrompt != "" {
+		base = cfg.SystemPrompt
+	}
+	if cfg.AppendSystemPrompt != "" {
+		base = base + "\n\n" + cfg.AppendSystemPrompt
+	}
+	a.SystemPrompt = base
 	a.EstimateTokens = estimateTokens
 	a.ShouldCompact = func(ag *Agent, msgs []Message) bool {
 		// Trigger near the token budget when one is set; else on a message

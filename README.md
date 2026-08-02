@@ -75,12 +75,40 @@ launched with env + args by the orchestrator):
 | `LATIGO_OUTPUT_SCHEMA` | — | optional JSON Schema for the `finish` tool's output |
 | `LATIGO_RESUME` | `0` | `1`/`true` continues the last run from its log |
 | `LATIGO_STREAM` | `0` | `1`/`true` streams chat completions (text deltas to a sink; the assembled message is still the record) |
+| `LATIGO_SYSTEM_PROMPT` | — | inline system-prompt override (replaces the default); empty = unset |
+| `LATIGO_SYSTEM_PROMPT_FILE` | — | path to a file whose contents override the default system prompt |
+| `LATIGO_APPEND_SYSTEM_PROMPT` | — | inline text appended after the system prompt (default or override) |
+| `LATIGO_APPEND_SYSTEM_PROMPT_FILE` | — | path to a file whose contents are appended after the system prompt |
 | `LATIGO_COMPACTION` | `window` | `window` (deterministic) or `llm` (model-driven summary) |
 | `LATIGO_MAX_TURNS` | `16` | usage limit |
 | `LATIGO_MAX_TOTAL_TOKENS` | `0` = unlimited | usage limit |
 | `LATIGO_MAX_TOOL_INVOCATIONS` | `0` = unlimited | usage limit |
 | `LATIGO_MAX_WALL_CLOCK_S` | `1800` | usage limit |
 | `LATIGO_SHELL_EXEC_TIMEOUT_S` | `60` | per-leaf-command timeout |
+
+## System prompt
+
+By default Latigo uses a built-in system prompt that identifies the harness,
+lists its three tools (`shell`, `tool_list`, `finish`), and describes the
+`tool_list` → `<name> --help` discovery convention. You can change it at
+launch with two knobs, each settable inline or from a file:
+
+- **Override** (`LATIGO_SYSTEM_PROMPT` / `LATIGO_SYSTEM_PROMPT_FILE`) — a
+  complete prompt that *replaces* the default. Inline takes precedence over
+  the file; an empty inline value is treated as unset.
+- **Append** (`LATIGO_APPEND_SYSTEM_PROMPT` /
+  `LATIGO_APPEND_SYSTEM_PROMPT_FILE`) — text concatenated after the prompt
+  (default or override), separated by a blank line, for project-specific
+  additions without rewriting the whole prompt.
+
+A custom prompt is **opaque plain text**: Latigo does not interpret it (no
+templating, no variable substitution) and does not merge the built-in tool
+descriptions into it. An override that omits `finish` won't terminate on
+`finish`, so an override is responsible for telling the model how to use the
+harness's tools. A configured `*_FILE` path that is missing or unreadable fails
+at launch with an error naming the path, rather than silently using the
+default. The chosen source (`default` / `override` / `default+append` /
+`override+append`) is recorded in the `run_start` event config.
 
 ## Event log
 
