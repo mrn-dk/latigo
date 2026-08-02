@@ -46,6 +46,15 @@ type Config struct {
 	// deltas forwarded to DeltaSink as they arrive. Off by default; when on, the
 	// assembled message is still the unit of transcript and logging.
 	Stream bool
+	// SystemPrompt is a full override of the built-in default system prompt.
+	// Empty means unset — the default is used. Resolved from LATIGO_SYSTEM_PROMPT
+	// (inline, takes precedence) or LATIGO_SYSTEM_PROMPT_FILE (file contents).
+	SystemPrompt string
+	// AppendSystemPrompt is text appended after the system prompt (default or
+	// override), separated by a blank line. Empty means no append. Resolved from
+	// LATIGO_APPEND_SYSTEM_PROMPT (inline, takes precedence) or
+	// LATIGO_APPEND_SYSTEM_PROMPT_FILE (file contents).
+	AppendSystemPrompt string
 
 	// Usage limits (spec §2.5), enforced in-loop.
 	MaxTurns            int
@@ -70,23 +79,27 @@ const (
 
 // envNames are the environment variables Latigo reads.
 const (
-	EnvGoal         = "LATIGO_GOAL"
-	EnvModel        = "LATIGO_MODEL"
-	EnvLLMBaseURL   = "LATIGO_LLM_BASE_URL"
-	EnvAPIKey       = "LATIGO_API_KEY"
-	EnvWorkspace    = "LATIGO_WORKSPACE"
-	EnvEventLog     = "LATIGO_EVENT_LOG"
-	EnvAllowlist    = "LATIGO_ALLOWLIST"
-	EnvAllow        = "LATIGO_ALLOW"
-	EnvOutputSchema = "LATIGO_OUTPUT_SCHEMA"
-	EnvResume       = "LATIGO_RESUME"
-	EnvCompaction   = "LATIGO_COMPACTION"
-	EnvStream       = "LATIGO_STREAM"
-	EnvMaxTurns     = "LATIGO_MAX_TURNS"
-	EnvMaxTokens    = "LATIGO_MAX_TOTAL_TOKENS"
-	EnvMaxTools     = "LATIGO_MAX_TOOL_INVOCATIONS"
-	EnvMaxWallClock = "LATIGO_MAX_WALL_CLOCK_S"
-	EnvShellTimeout = "LATIGO_SHELL_EXEC_TIMEOUT_S"
+	EnvGoal                   = "LATIGO_GOAL"
+	EnvModel                  = "LATIGO_MODEL"
+	EnvLLMBaseURL             = "LATIGO_LLM_BASE_URL"
+	EnvAPIKey                 = "LATIGO_API_KEY"
+	EnvWorkspace              = "LATIGO_WORKSPACE"
+	EnvEventLog               = "LATIGO_EVENT_LOG"
+	EnvAllowlist              = "LATIGO_ALLOWLIST"
+	EnvAllow                  = "LATIGO_ALLOW"
+	EnvOutputSchema           = "LATIGO_OUTPUT_SCHEMA"
+	EnvResume                 = "LATIGO_RESUME"
+	EnvCompaction             = "LATIGO_COMPACTION"
+	EnvStream                 = "LATIGO_STREAM"
+	EnvSystemPrompt           = "LATIGO_SYSTEM_PROMPT"
+	EnvSystemPromptFile       = "LATIGO_SYSTEM_PROMPT_FILE"
+	EnvAppendSystemPrompt     = "LATIGO_APPEND_SYSTEM_PROMPT"
+	EnvAppendSystemPromptFile = "LATIGO_APPEND_SYSTEM_PROMPT_FILE"
+	EnvMaxTurns               = "LATIGO_MAX_TURNS"
+	EnvMaxTokens              = "LATIGO_MAX_TOTAL_TOKENS"
+	EnvMaxTools               = "LATIGO_MAX_TOOL_INVOCATIONS"
+	EnvMaxWallClock           = "LATIGO_MAX_WALL_CLOCK_S"
+	EnvShellTimeout           = "LATIGO_SHELL_EXEC_TIMEOUT_S"
 )
 
 // LoadConfig reads configuration from the environment, with a positional
@@ -125,6 +138,19 @@ func LoadConfig() (Config, error) {
 	if v := os.Getenv(EnvStream); v == "1" || strings.EqualFold(v, "true") {
 		cfg.Stream = true
 	}
+	// System prompt: inline override takes precedence over a file; empty inline
+	// is treated as unset. A configured file path that is missing/unreadable is a
+	// hard launch error (fail loudly, do not silently fall back to the default).
+	override, err := readPromptKnob(EnvSystemPrompt, EnvSystemPromptFile)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.SystemPrompt = override
+	append, err := readPromptKnob(EnvAppendSystemPrompt, EnvAppendSystemPromptFile)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.AppendSystemPrompt = append
 	cfg.MaxTurns = envInt(EnvMaxTurns, cfg.MaxTurns)
 	cfg.MaxTotalTokens = envInt(EnvMaxTokens, cfg.MaxTotalTokens)
 	cfg.MaxToolInvocations = envInt(EnvMaxTools, cfg.MaxToolInvocations)
@@ -154,10 +180,30 @@ func envInt(name string, def int) int {
 	return n
 }
 
+// readPromptKnob resolves a system-prompt knob (override or append) from its
+// inline and file environment variables. Inline takes precedence; an empty
+// inline value is treated as unset so it cannot blank the prompt. A configured
+// file path that is missing or unreadable is a hard error — the caller must not
+// silently fall back to the default.
+func readPromptKnob(inlineEnv, fileEnv string) (string, error) {
+	if v := os.Getenv(inlineEnv); v != "" {
+		return v, nil
+	}
+	if path := os.Getenv(fileEnv); path != "" {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read system prompt file %q: %w", path, err)
+		}
+		return string(b), nil
+	}
+	return "", nil
+}
+
 // configSummary is the shape recorded in the run_start event.
 type configSummary struct {
 	Compaction              string `json:"compaction,omitempty"`
 	Stream                  bool   `json:"stream,omitempty"`
+	SystemPromptSource      string `json:"system_prompt_source,omitempty"`
 	MaxTurns                int    `json:"max_turns,omitempty"`
 	MaxTotalTokens          int    `json:"max_total_tokens,omitempty"`
 	MaxToolInvocations      int    `json:"max_tool_invocations,omitempty"`
@@ -165,10 +211,24 @@ type configSummary struct {
 	ShellExecTimeoutSeconds int    `json:"shell_exec_timeout_seconds,omitempty"`
 }
 
+// promptSource reports which system prompt this run uses, for the run_start
+// event: "default", "override", "default+append", or "override+append".
+func (c Config) promptSource() string {
+	base := "default"
+	if c.SystemPrompt != "" {
+		base = "override"
+	}
+	if c.AppendSystemPrompt != "" {
+		return base + "+append"
+	}
+	return base
+}
+
 func (c Config) summary() json.RawMessage {
 	s := configSummary{
 		Compaction:              c.Compaction,
 		Stream:                  c.Stream,
+		SystemPromptSource:      c.promptSource(),
 		MaxTurns:                c.MaxTurns,
 		MaxTotalTokens:          c.MaxTotalTokens,
 		MaxToolInvocations:      c.MaxToolInvocations,

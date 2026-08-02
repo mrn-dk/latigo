@@ -292,3 +292,33 @@ func TestAgentResumeContinuesTranscript(t *testing.T) {
 }
 
 func ptrFloat(v float64) *float64 { return &v }
+
+func TestAgentSystemPromptDefault(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "g"})
+	if agent.SystemPrompt != defaultSystemPrompt {
+		t.Fatalf("default prompt not used; got %q", agent.SystemPrompt)
+	}
+}
+
+func TestAgentSystemPromptOverride(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "g", SystemPrompt: "my custom prompt"})
+	if agent.SystemPrompt != "my custom prompt" {
+		t.Fatalf("override not applied; got %q", agent.SystemPrompt)
+	}
+}
+
+func TestAgentSystemPromptAppendToDefault(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "g", AppendSystemPrompt: "extra rules"})
+	want := defaultSystemPrompt + "\n\n" + "extra rules"
+	if agent.SystemPrompt != want {
+		t.Fatalf("append-to-default wrong;\n got=%q\nwant=%q", agent.SystemPrompt, want)
+	}
+}
+
+func TestAgentSystemPromptAppendToOverride(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "g", SystemPrompt: "custom", AppendSystemPrompt: "extra"})
+	want := "custom" + "\n\n" + "extra"
+	if agent.SystemPrompt != want {
+		t.Fatalf("append-to-override wrong; got %q want %q", agent.SystemPrompt, want)
+	}
+}
