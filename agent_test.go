@@ -437,6 +437,71 @@ func TestAgentResumedRunGetsFullTurnBudget(t *testing.T) {
 	}
 }
 
+// TestAgentResumeTwiceKeepsTurnsDistinct: resuming the same log repeatedly
+// keeps numbering forward from its high-water mark every time.
+func TestAgentResumeTwiceKeepsTurnsDistinct(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "loop", MaxTurns: 2})
+	writeFile(t, filepath.Join(agent.cfg.Workspace, "seed.txt"), "x\n")
+	run := func(a *Agent) {
+		t.Helper()
+		endpoint := newMockEndpoint(t,
+			respWithToolCall("shell", `{"command":"ls"}`),
+			respWithToolCall("shell", `{"command":"ls"}`),
+		)
+		a.llm.BaseURL = endpoint.URL()
+		if _, reason, err := a.Run(t.Context()); err != nil || reason != "max_turns" {
+			t.Fatalf("reason=%q err=%v", reason, err)
+		}
+	}
+	run(agent)
+	for i := 0; i < 2; i++ {
+		run(setupAgent(t, Config{
+			Goal:      "loop",
+			MaxTurns:  2,
+			Resume:    true,
+			EventLog:  agent.cfg.EventLog,
+			Workspace: agent.cfg.Workspace,
+		}))
+	}
+
+	turns := logTurnNumbers(t, agent.cfg.EventLog)
+	want := []int{1, 2, 3, 4, 5, 6}
+	if len(turns) != len(want) {
+		t.Fatalf("turn numbers=%v want %v", turns, want)
+	}
+	for i, n := range turns {
+		if n != want[i] {
+			t.Fatalf("turn numbers=%v want %v", turns, want)
+		}
+	}
+}
+
+// TestAgentTurnEndNamesTheTurnThatEnded: the turn-end marker names the turn it
+// closes, not the one after it.
+func TestAgentTurnEndNamesTheTurnThatEnded(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "loop", MaxTurns: 3})
+	writeFile(t, filepath.Join(agent.cfg.Workspace, "seed.txt"), "x\n")
+	endpoint := newMockEndpoint(t,
+		respWithToolCall("shell", `{"command":"ls"}`),
+		respWithToolCall("shell", `{"command":"ls"}`),
+		respWithToolCall("shell", `{"command":"ls"}`),
+	)
+	agent.llm.BaseURL = endpoint.URL()
+	if _, _, err := agent.Run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	starts := logTurnNumbers(t, agent.cfg.EventLog)
+	ends := logTurnNumbersOfKind(t, agent.cfg.EventLog, KindTurnEnd)
+	if len(ends) != len(starts) {
+		t.Fatalf("turn=%v turn_end=%v", starts, ends)
+	}
+	for i := range starts {
+		if starts[i] != ends[i] {
+			t.Fatalf("turn_end %v does not match turn %v", ends, starts)
+		}
+	}
+}
+
 func ptrFloat(v float64) *float64 { return &v }
 
 func TestAgentSystemPromptDefault(t *testing.T) {
