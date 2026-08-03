@@ -291,6 +291,217 @@ func TestAgentResumeContinuesTranscript(t *testing.T) {
 	}
 }
 
+// logTurnNumbers returns the turn numbers of the `turn` events in a log, in
+// the order they were recorded.
+func logTurnNumbers(t *testing.T, path string) []int {
+	t.Helper()
+	return logTurnNumbersOfKind(t, path, KindTurn)
+}
+
+// logTurnNumbersOfKind returns the `turn` field of every event of the given
+// kind. `turn`, `turn_end` and `llm` payloads all carry it under that key.
+func logTurnNumbersOfKind(t *testing.T, path string, kind string) []int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var turns []int
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if line == "" {
+			continue
+		}
+		var e Event
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("bad log line %q: %v", line, err)
+		}
+		if e.Kind != kind {
+			continue
+		}
+		var p TurnPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("bad %s payload %s: %v", kind, e.Payload, err)
+		}
+		turns = append(turns, p.Turn)
+	}
+	return turns
+}
+
+// TestAgentResumeDoesNotRepeatTurnNumbers is the bug, stated as a test: a run
+// that resumes an existing log must continue its turn numbering rather than
+// restart it, so no turn number appears twice across the agent's whole log.
+func TestAgentResumeDoesNotRepeatTurnNumbers(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "work then finish"})
+	writeFile(t, filepath.Join(agent.cfg.Workspace, "seed.txt"), "x\n")
+	first := newMockEndpoint(t,
+		respWithToolCall("shell", `{"command":"ls"}`),
+		respWithToolCall("shell", `{"command":"ls"}`),
+		respWithToolCall("finish", `{"output":"first"}`),
+	)
+	agent.llm.BaseURL = first.URL()
+	if _, _, err := agent.Run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed := setupAgent(t, Config{
+		Goal:      "keep going",
+		Resume:    true,
+		EventLog:  agent.cfg.EventLog,
+		Workspace: agent.cfg.Workspace,
+	})
+	second := newMockEndpoint(t,
+		respWithToolCall("shell", `{"command":"ls"}`),
+		respWithToolCall("finish", `{"output":"second"}`),
+	)
+	resumed.llm.BaseURL = second.URL()
+	if _, _, err := resumed.Run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	turns := logTurnNumbers(t, agent.cfg.EventLog)
+	if len(turns) != 5 {
+		t.Fatalf("turn events=%v want 5 of them", turns)
+	}
+	seen := map[int]bool{}
+	for _, n := range turns {
+		if seen[n] {
+			t.Fatalf("turn number %d appears twice across the log: %v", n, turns)
+		}
+		seen[n] = true
+	}
+	want := []int{1, 2, 3, 4, 5}
+	for i, n := range turns {
+		if n != want[i] {
+			t.Fatalf("turn numbers=%v want %v", turns, want)
+		}
+	}
+}
+
+// TestAgentFreshRunStartsAtTurnOne pins the numbering base: the first turn of
+// an agent with no recorded history is turn 1.
+func TestAgentFreshRunStartsAtTurnOne(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "finish immediately"})
+	endpoint := newMockEndpoint(t, respWithToolCall("finish", `{"output":"done"}`))
+	agent.llm.BaseURL = endpoint.URL()
+	if _, _, err := agent.Run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	turns := logTurnNumbers(t, agent.cfg.EventLog)
+	if len(turns) != 1 || turns[0] != 1 {
+		t.Fatalf("turn events=%v want [1]", turns)
+	}
+	llm := logTurnNumbersOfKind(t, agent.cfg.EventLog, KindLLM)
+	if len(llm) != 1 || llm[0] != 1 {
+		t.Fatalf("llm turn numbers=%v want [1]", llm)
+	}
+}
+
+// TestAgentResumedRunGetsFullTurnBudget: max_turns bounds the current run, not
+// the agent's lifetime turn number, so a resumed run may take max_turns turns
+// however many the agent has taken before.
+func TestAgentResumedRunGetsFullTurnBudget(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "loop forever", MaxTurns: 2})
+	writeFile(t, filepath.Join(agent.cfg.Workspace, "seed.txt"), "x\n")
+	first := newMockEndpoint(t,
+		respWithToolCall("shell", `{"command":"ls"}`),
+		respWithToolCall("shell", `{"command":"ls"}`),
+	)
+	agent.llm.BaseURL = first.URL()
+	if _, reason, err := agent.Run(t.Context()); err != nil || reason != "max_turns" {
+		t.Fatalf("first run reason=%q err=%v", reason, err)
+	}
+	before := len(logTurnNumbers(t, agent.cfg.EventLog))
+
+	resumed := setupAgent(t, Config{
+		Goal:      "loop forever",
+		MaxTurns:  2,
+		Resume:    true,
+		EventLog:  agent.cfg.EventLog,
+		Workspace: agent.cfg.Workspace,
+	})
+	second := newMockEndpoint(t,
+		respWithToolCall("shell", `{"command":"ls"}`),
+		respWithToolCall("shell", `{"command":"ls"}`),
+	)
+	resumed.llm.BaseURL = second.URL()
+	if _, reason, err := resumed.Run(t.Context()); err != nil || reason != "max_turns" {
+		t.Fatalf("resumed run reason=%q err=%v", reason, err)
+	}
+
+	turns := logTurnNumbers(t, agent.cfg.EventLog)
+	if got := len(turns) - before; got != 2 {
+		t.Fatalf("resumed run took %d turns, want its full budget of 2 (all turns: %v)", got, turns)
+	}
+	if want := []int{1, 2, 3, 4}; len(turns) != len(want) || turns[len(turns)-1] != 4 {
+		t.Fatalf("turn numbers=%v want %v", turns, want)
+	}
+}
+
+// TestAgentResumeTwiceKeepsTurnsDistinct: resuming the same log repeatedly
+// keeps numbering forward from its high-water mark every time.
+func TestAgentResumeTwiceKeepsTurnsDistinct(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "loop", MaxTurns: 2})
+	writeFile(t, filepath.Join(agent.cfg.Workspace, "seed.txt"), "x\n")
+	run := func(a *Agent) {
+		t.Helper()
+		endpoint := newMockEndpoint(t,
+			respWithToolCall("shell", `{"command":"ls"}`),
+			respWithToolCall("shell", `{"command":"ls"}`),
+		)
+		a.llm.BaseURL = endpoint.URL()
+		if _, reason, err := a.Run(t.Context()); err != nil || reason != "max_turns" {
+			t.Fatalf("reason=%q err=%v", reason, err)
+		}
+	}
+	run(agent)
+	for i := 0; i < 2; i++ {
+		run(setupAgent(t, Config{
+			Goal:      "loop",
+			MaxTurns:  2,
+			Resume:    true,
+			EventLog:  agent.cfg.EventLog,
+			Workspace: agent.cfg.Workspace,
+		}))
+	}
+
+	turns := logTurnNumbers(t, agent.cfg.EventLog)
+	want := []int{1, 2, 3, 4, 5, 6}
+	if len(turns) != len(want) {
+		t.Fatalf("turn numbers=%v want %v", turns, want)
+	}
+	for i, n := range turns {
+		if n != want[i] {
+			t.Fatalf("turn numbers=%v want %v", turns, want)
+		}
+	}
+}
+
+// TestAgentTurnEndNamesTheTurnThatEnded: the turn-end marker names the turn it
+// closes, not the one after it.
+func TestAgentTurnEndNamesTheTurnThatEnded(t *testing.T) {
+	agent := setupAgent(t, Config{Goal: "loop", MaxTurns: 3})
+	writeFile(t, filepath.Join(agent.cfg.Workspace, "seed.txt"), "x\n")
+	endpoint := newMockEndpoint(t,
+		respWithToolCall("shell", `{"command":"ls"}`),
+		respWithToolCall("shell", `{"command":"ls"}`),
+		respWithToolCall("shell", `{"command":"ls"}`),
+	)
+	agent.llm.BaseURL = endpoint.URL()
+	if _, _, err := agent.Run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	starts := logTurnNumbers(t, agent.cfg.EventLog)
+	ends := logTurnNumbersOfKind(t, agent.cfg.EventLog, KindTurnEnd)
+	if len(ends) != len(starts) {
+		t.Fatalf("turn=%v turn_end=%v", starts, ends)
+	}
+	for i := range starts {
+		if starts[i] != ends[i] {
+			t.Fatalf("turn_end %v does not match turn %v", ends, starts)
+		}
+	}
+}
+
 func ptrFloat(v float64) *float64 { return &v }
 
 func TestAgentSystemPromptDefault(t *testing.T) {

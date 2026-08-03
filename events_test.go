@@ -43,6 +43,74 @@ func TestEventLogAppendAndSeq(t *testing.T) {
 	}
 }
 
+func TestResumeTurnFromEmptyLog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	l, err := OpenEventLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	last, err := l.ResumeTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last != 0 {
+		t.Fatalf("last turn=%d want 0, so the first turn is 1", last)
+	}
+}
+
+func TestResumeTurnFromRecordedTurns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	l, _ := OpenEventLog(path)
+	_, _ = l.Append(KindRunStart, RunStartPayload{RunID: "r1", Goal: "g"})
+	for i := 1; i <= 6; i++ {
+		_, _ = l.Append(KindTurn, TurnPayload{Turn: i})
+		_, _ = l.Append(KindLLM, LLMPayload{Turn: i, Message: Message{Role: "assistant"}})
+		_, _ = l.Append(KindTurnEnd, TurnEndPayload{Turn: i})
+	}
+	_, _ = l.Append(KindRunEnd, RunEndPayload{Reason: "max_turns"})
+	l.Close()
+
+	l2, err := OpenEventLog(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	last, err := l2.ResumeTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last != 6 {
+		t.Fatalf("last turn=%d want 6, so the first resumed turn is 7", last)
+	}
+	// The same scan serves the sequence counter, which must be unaffected.
+	if err := l2.ResumeSeq(); err != nil {
+		t.Fatal(err)
+	}
+	if l2.seq != 20 {
+		t.Fatalf("resumed seq=%d want 20", l2.seq)
+	}
+}
+
+// TestResumeTurnFromTurnEndOnly: the turn number is derived from any event
+// that carries one, so a log truncated mid-turn still resumes correctly.
+func TestResumeTurnFromTurnEndOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "log.jsonl")
+	l, _ := OpenEventLog(path)
+	_, _ = l.Append(KindTurnEnd, TurnEndPayload{Turn: 4})
+	l.Close()
+
+	l2, _ := OpenEventLog(path)
+	defer l2.Close()
+	last, err := l2.ResumeTurn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last != 4 {
+		t.Fatalf("last turn=%d want 4", last)
+	}
+}
+
 func TestLoadTranscriptRebuildsConversation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "log.jsonl")
 	l, _ := OpenEventLog(path)

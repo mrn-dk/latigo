@@ -135,13 +135,22 @@ conversation back out of the log, not re-executing it.
 **Kinds:**
 
 - `run_start` — `{"run_id":"run-...","goal":"...","model":"...","llm_base_url":"...","grants":{"workspace":"/workspace","net":["llm.example"],"commands":["rg","pytest"]},"config":{...limits...}}`
-- `turn` — a turn boundary, recorded at the top of each turn: `{"turn":0}`
-- `llm` — one chat-completion result; the assistant message is recorded verbatim so the transcript can be rebuilt by reading the log: `{"turn":0,"model":"...","latency_ms":420,"input_tokens":120,"output_tokens":30,"total_tokens":150,"finish_reason":"tool_calls","message":{"role":"assistant","content":"...","tool_calls":[...]}}`
+- `turn` — a turn boundary, recorded at the top of each turn: `{"turn":1}`
+- `llm` — one chat-completion result; the assistant message is recorded verbatim so the transcript can be rebuilt by reading the log: `{"turn":1,"model":"...","latency_ms":420,"input_tokens":120,"output_tokens":30,"total_tokens":150,"finish_reason":"tool_calls","message":{"role":"assistant","content":"...","tool_calls":[...]}}`
 - `tool` — tool/exec intent and result, with an idempotency key. Intent is recorded **before** dispatch; the result shares the key + call id. `status` ∈ `intent` | `ok` | `error` | `invalid` | `denied`.
 - `finish` — the validated final output: `{"output":"...","valid":true,"errors":[]}`
 - `turn_end` — end-of-turn marker. `checkpoint_id` is assigned by the orchestrator; it is empty on the single-host path, where the log and workspace *are* the recoverable state. `egress` lists the destinations reached this turn.
 - `run_end` — `{"reason":"finished","error":""}` where `reason` ∈ `finished` | `answered` | `max_turns` | `max_total_tokens` | `max_tool_invocations` | `max_wall_clock` | `llm_error` | `dispatch_error`.
 - `log` — operational notes (validation failures, etc.) that are not part of the conversation.
+
+**Turn numbering:** the first turn of an agent with no recorded history is
+**turn 1**, and turn numbers continue across resume — a run resuming a log
+whose highest turn is 6 starts at turn 7, so no turn number appears twice in a
+log. The number is derived from the log on resume, the same way the sequence
+number is. `max_turns` is a separate quantity: it bounds the turns taken by the
+*current* run, so a resumed run gets its full budget rather than one reduced by
+prior turns. Logs written before this change are 0-based; a resumed run
+continues forward from such a log's highest turn, so it stays ordered.
 
 **Transcript rebuild (resume):** `LoadTranscript` reads the log and rebuilds the conversation — `run_start` → the goal and model; each `llm` event → one assistant message (with any `tool_calls`); each terminal `tool` event (`ok`/`error`/`invalid`/`denied`) → one tool-role message, deduplicated by `call_id`. `intent`-only tool events, `turn`, `turn_end`, `run_end`, and `log` events are skipped. The system prompt is supplied by the caller; everything else comes from the log.
 
